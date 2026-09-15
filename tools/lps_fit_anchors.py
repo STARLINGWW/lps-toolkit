@@ -98,12 +98,22 @@ def residuals_from_params(p, ids, meas_sets, nom_vec, lam):
     由于 TDoA 对整体刚体变换不变，这里加一个很弱的正则项把解"拴"在名义布局附近
     （既消除刚体简并，也符合"名义坐标大致是对的、只差几十厘米到一米"的实际情况）。
     """
+    nA = 3 * len(ids)
     A = {ids[k]: np.array(p[3 * k:3 * k + 3]) for k in range(len(ids))}
     out = []
-    for P, meas in meas_sets:
+    for k, item in enumerate(meas_sets):
+        P, meas = item[0], item[1]
+        if P is None:
+            # 自由点：只知道高度 z（item[2]），平面位置 (x, y) 也在解里
+            P = np.array([p[nA + 2 * k], p[nA + 2 * k + 1], float(item[2])])
         for (i, j), d in meas.items():
             out.append((np.linalg.norm(P - A[i]) - np.linalg.norm(P - A[j])) - d)
-    out.extend(list(lam * (np.array(p) - nom_vec)))
+    out.extend(list(lam * (np.array(p[:nA]) - nom_vec)))
+    for k, item in enumerate(meas_sets):
+        if item[0] is None:
+            # 自由点的弱先验：待在场地中心附近
+            out.append(lam * (p[nA + 2 * k] - 2.5))
+            out.append(lam * (p[nA + 2 * k + 1] - 2.5))
     return np.array(out)
 
 

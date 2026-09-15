@@ -161,8 +161,15 @@ class CaptureParser:
             return
         src = int(m.group(1), 16)
         dst = int(m.group(2), 16)
-        ts5 = bytes.fromhex(m.group(3).decode("ascii"))
-        payload = bytes.fromhex(m.group(4).decode("ascii"))
+        hx_ts = m.group(3).decode("ascii")
+        hx_payload = m.group(4).decode("ascii")
+        if len(hx_payload) % 2:          # 抓包在被截断时可能留下半个字节
+            hx_payload = hx_payload[:-1]
+        try:
+            ts5 = bytes.fromhex(hx_ts)
+            payload = bytes.fromhex(hx_payload)
+        except ValueError:
+            return
         if not payload:
             return
         self.text_frames += 1
