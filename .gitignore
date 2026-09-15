@@ -1,0 +1,21 @@
+# 第三方 clone（由 bootstrap.ps1 拉取）
+clones/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 抓包数据（体积大，按需保留）
+captures/*.bin
+captures/*.yaml
+!captures/.gitkeep
+
+# 日志
+logs/*
+!logs/.gitkeep
+
+# 编辑器
+.vscode/
+.idea/

@@ -1,0 +1,20 @@
+# 统一按文本处理，但二进制文件要显式声明，避免 diff/换行转换损坏
+* text=auto
+
+# 二进制
+*.dfu  binary
+*.bin  binary
+*.pyc  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+
+# Windows 脚本保持 CRLF，避免 PowerShell 5.1 解析问题
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+
+# 文档与脚本用 LF
+*.md   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
