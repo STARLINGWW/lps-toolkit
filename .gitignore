@@ -19,3 +19,7 @@ logs/*
 # 编辑器
 .vscode/
 .idea/
+
+# 临时素材 / 压缩包（内容已整理进 docs/）
+*.zip
+_incoming/
