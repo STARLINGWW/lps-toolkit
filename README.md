@@ -30,8 +30,8 @@ with a passive sniffer node plus a host-side solver.
 ## Quick start
 
 ```powershell
-git clone https://github.com/STARLINGWW/uwb-tdoa-lps.git
-cd uwb-tdoa-lps
+git clone https://github.com/STARLINGWW/lps-toolkit.git
+cd lps-toolkit
 powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 ```
 
@@ -229,6 +229,7 @@ Automated inspection: `powershell -ExecutionPolicy Bypass -File .\tools\fix_seri
 
 | Document | Content |
 |---|---|
+| [`docs/sniffer-positioning.md`](docs/sniffer-positioning.md) | **Positioning with a sniffer node** — principle, setup, commands, acceptance (EN + 中文) |
 | [`docs/操作流程.md`](docs/操作流程.md) | **Start here** — hardware → driver → flash → configure, with flow charts and screenshots |
 | [`docs/刷写与配置SOP.md`](docs/刷写与配置SOP.md) | Step-by-step flashing SOP, DFU state table, troubleshooting |
 | [`docs/命令速查.md`](docs/命令速查.md) | Command cheat sheet (flash / configure / inspect) |
@@ -263,8 +264,8 @@ Everything under `clones\` remains under its original licence.
 ## 快速开始
 
 ```powershell
-git clone https://github.com/STARLINGWW/uwb-tdoa-lps.git
-cd uwb-tdoa-lps
+git clone https://github.com/STARLINGWW/lps-toolkit.git
+cd lps-toolkit
 powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 ```
 
@@ -442,6 +443,7 @@ Windows **不会创建 COM 口** —— 于是既读不到也刷不了。
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/sniffer-positioning.md`](docs/sniffer-positioning.md) | **用 Sniffer 实现定位** —— 原理、配置、命令、验收标准（中英对照） |
 | [`docs/操作流程.md`](docs/操作流程.md) | **从这里开始** —— 硬件 → 驱动 → 刷写 → 配置，含流程图与截图 |
 | [`docs/刷写与配置SOP.md`](docs/刷写与配置SOP.md) | 刷写标准流程、DFU 状态速查、故障处理 |
 | [`docs/命令速查.md`](docs/命令速查.md) | 刷写 / 配置 / 查看 三类命令速查 |

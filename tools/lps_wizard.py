@@ -25,6 +25,7 @@ Design notes
 import os
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
@@ -102,6 +103,18 @@ S = {
         "fw_old2": "%-8s firmware old: TDoA2 only   current: %s / ID %s   [flash to get TDoA3]",
         "fw_old1": "%-8s firmware very old   [flashing required]",
         "fw_unknown": "%-8s firmware unknown (probe failed)",
+        "node_fw": "firmware",
+        "node_cur": "current",
+        "node_verdict": "verdict",
+        "fw_sum_ok": "OK, %d modes incl. TDoA3",
+        "fw_sum_old2": "old: TDoA2 only, no TDoA3",
+        "fw_sum_old1": "very old (no TDoA2 either)",
+        "fw_sum_unknown": "unknown (probe failed)",
+        "verdict_ok": "usable as-is, no flashing needed",
+        "verdict_old2": "flash to get TDoA3",
+        "verdict_old1": "flashing required",
+        "dfu_verdict_ready": "flashable (menu [1])",
+        "dfu_verdict_stuck": "needs recovery (menu [5])",
         "dfu": "DFU device    :",
         "dfu_none": "none",
         "dfu_ready": "0483:df11  bState=%d (%s)  -> flashable",
@@ -155,7 +168,7 @@ S = {
         "done_port": "serial port",
         "done_id": "node ID",
         "done_mode": "mode",
-        "done_radio": "bitrate / preamble",
+        "done_radio": "bitrate/preamble",
         "done_selftest": "boot self-test",
         "selftest_ok": "%d x [OK]",
         "selftest_bad": "%d x [ERROR]",
@@ -193,6 +206,18 @@ S = {
         "fw_old2": "%-8s 固件偏旧：只有 TDoA2  当前: %s / ID %s  [要 TDoA3 需刷固件]",
         "fw_old1": "%-8s 固件过旧  [必须刷固件]",
         "fw_unknown": "%-8s 固件未知（探测失败）",
+        "node_fw": "固件",
+        "node_cur": "当前",
+        "node_verdict": "结论",
+        "fw_sum_ok": "OK，%d 种模式（含 TDoA3）",
+        "fw_sum_old2": "偏旧：只有 TDoA2，没有 TDoA3",
+        "fw_sum_old1": "过旧（连 TDoA2 都没有）",
+        "fw_sum_unknown": "未知（探测失败）",
+        "verdict_ok": "无需刷固件，可直接配置",
+        "verdict_old2": "要 TDoA3 需刷固件",
+        "verdict_old1": "需要刷固件",
+        "dfu_verdict_ready": "可刷写（菜单 [1]）",
+        "dfu_verdict_stuck": "需要恢复（菜单 [5]）",
         "dfu": "DFU 设备    :",
         "dfu_none": "无",
         "dfu_ready": "0483:df11  bState=%d (%s)  -> 可刷写",
@@ -246,7 +271,7 @@ S = {
         "done_port": "串口",
         "done_id": "编号 ID",
         "done_mode": "模式",
-        "done_radio": "比特率 / 前导码",
+        "done_radio": "射频",
         "done_selftest": "开机自检",
         "selftest_ok": "%d 个 [OK]",
         "selftest_bad": "%d 个 [ERROR]",
@@ -308,6 +333,19 @@ def err(m):
 def ask(prompt, default=""):
     s = input("  %s%s: " % (prompt, (" [%s]" % default) if default else "")).strip()
     return s if s else default
+
+
+def disp_width(s):
+    """字符串的显示宽度：中日韩全角字符按 2 列算，否则中文列会对不齐。"""
+    w = 0
+    for ch in str(s):
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - disp_width(s))
 
 
 def confirm(prompt, default_no=True):
@@ -396,17 +434,21 @@ def render(snap, message=None):
     # --- firmware capability per node ---
     for n in snap["nodes"]:
         fw = n["fw"]
+        print("      " + n["device"])
         if not fw:
-            print("    %-12s %s" % (n["device"], t("fw_unknown")))
+            print("        " + pad(t("node_fw") + ":", 12) + t("fw_sum_unknown"))
             continue
         nid = fw.get("address", fw.get("id", "?"))
+        cur = "%s / ID %s" % (fw.get("mode", "?"), nid)
         if fw.get("has_tdoa3"):
-            print("    " + t("fw_ok", n["device"], len(fw.get("modes", [])),
-                             fw.get("mode", "?"), nid))
+            summary, verdict = t("fw_sum_ok", len(fw.get("modes", []))), t("verdict_ok")
         elif fw.get("has_tdoa2"):
-            print("    " + t("fw_old2", n["device"], fw.get("mode", "?"), nid))
+            summary, verdict = t("fw_sum_old2"), t("verdict_old2")
         else:
-            print("    " + t("fw_old1", n["device"]))
+            summary, verdict = t("fw_sum_old1"), t("verdict_old1")
+        print("        " + pad(t("node_fw") + ":", 12) + summary)
+        print("        " + pad(t("node_cur") + ":", 12) + cur)
+        print("        " + pad(t("node_verdict") + ":", 12) + verdict)
     if snap["driver_trouble"]:
         print()
         warn(t("driver_trouble"))
@@ -418,8 +460,10 @@ def render(snap, message=None):
         print("    " + t("dfu") + " " + t("dfu_none"))
     elif snap["dfu"] in (2, 10):
         print("    " + t("dfu") + " " + t("dfu_ready", snap["dfu"], dfu_state_name(snap["dfu"])))
+        print("        " + pad(t("node_verdict") + ":", 12) + t("dfu_verdict_ready"))
     else:
         print("    " + t("dfu") + " " + t("dfu_stuck", snap["dfu"], dfu_state_name(snap["dfu"])))
+        print("        " + pad(t("node_verdict") + ":", 12) + t("dfu_verdict_stuck"))
     if message:
         print()
         for line in str(message).splitlines():
@@ -530,17 +574,28 @@ def flash_fw():
     return True
 
 
-def show_node_config(port, text=None):
+def show_node_config(port, text=None, cfg=None):
+    """竖向展示节点配置。
+
+    cfg 可直接传探测结果（probe_firmware 的返回值），省一次串口往返，
+    也避免"刚探测完又重开串口读不到横幅"的问题。
+    """
+    if cfg is None:
+        if text is None:
+            text = C.read_config_text(port) or ""
+        cfg = C.parse_banner(text)
     if text is None:
-        text = C.read_config_text(port) or ""
-    cfg = C.parse_banner(text)
-    print("    %-18s %s" % (t("done_id"), cfg.get("address", "?")))
-    print("    %-18s %s" % (t("done_mode"), cfg.get("mode", "?")))
-    print("    %-18s %s / %s" % (t("done_radio"), cfg.get("bitrate", "?"), cfg.get("preamble", "?")))
-    bad = text.count("[FAIL]") + text.count("[ERROR]")
-    good = text.count("[OK]")
-    print("    %-18s %s" % (t("done_selftest"),
-                            t("selftest_bad", bad) if bad else t("selftest_ok", good)))
+        text = ""
+    # 竖排、逐行一个字段，并按显示宽度对齐（中文按 2 列）
+    print("    " + pad(t("done_id") + ":", 20) + str(cfg.get("address", "?")))
+    print("    " + pad(t("done_mode") + ":", 20) + str(cfg.get("mode", "?")))
+    print("    " + pad(t("done_radio") + ":", 20) +
+          "%s / %s" % (cfg.get("bitrate", "?"), cfg.get("preamble", "?")))
+    src = text or cfg.get("raw", "")
+    bad = src.count("[FAIL]") + src.count("[ERROR]")
+    good = src.count("[OK]")
+    print("    " + pad(t("done_selftest") + ":", 20) +
+          (t("selftest_bad", bad) if bad else t("selftest_ok", good)))
     return cfg
 
 
@@ -633,7 +688,7 @@ def action_config(snap):
     port = target["device"]
     print()
     info(t("cfg_now"))
-    show_node_config(port)
+    show_node_config(port, cfg=target["fw"])
 
     mode = ask_mode()
     node_id = ask_id(mode)

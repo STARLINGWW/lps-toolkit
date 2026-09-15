@@ -143,15 +143,25 @@ def read_banner_until(ser, timeout=3.5):
 
 
 def read_config_text(port, timeout=3.5):
-    """打开串口读一次完整开机横幅，返回文本（失败返回 None）"""
-    try:
-        ser = open_port(port)
-    except SystemExit:
-        return None
-    try:
-        return read_banner_until(ser, timeout)
-    finally:
-        ser.close()
+    """打开串口读一次完整开机横幅，返回文本（失败返回 None）。
+
+    节点只在"检测到新的串口连接"时才重新打印横幅；如果刚探测过就立刻重开串口，
+    Windows 可能不产生断开事件，于是读不到内容 —— 所以这里重试几次。
+    """
+    text = ""
+    for attempt in range(3):
+        try:
+            ser = open_port(port)
+        except SystemExit:
+            return None
+        try:
+            text = read_banner_until(ser, timeout if attempt == 0 else 2.0)
+        finally:
+            ser.close()
+        if "Address is" in text or "Node started" in text:
+            return text
+        time.sleep(0.6)
+    return text
 
 
 def parse_banner(text):
