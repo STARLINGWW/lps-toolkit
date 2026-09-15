@@ -30,6 +30,7 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
 import lps_flash as F          # noqa: E402  (USB / DFU / 刷写)
+import lps_config as C         # noqa: E402  (串口配置 / 固件能力探测)
 
 # 载入 DfuSe 实现（lps-tools 或 clones/lps-tools）
 DFU_CLS, DFUSE = F.load_dfuse()
@@ -51,6 +52,63 @@ MODE_NAME = {
     "twr-anchor": "TWR Anchor",
     "twr-tag": "TWR Tag",
 }
+
+# 官方固件支持的全部模式（顺序与节点菜单一致：0-4）
+#   key, 显示名, 用途说明, 编号建议
+MODE_MENU = [
+    ("tdoa3",      "TDoA Anchor V3", "基站/锚点 —— 本项目默认用这个",      "0"),
+    ("sniffer",    "Sniffer",        "纯被动监听（数据出口）—— 本项目默认", "20"),
+    ("tdoa2",      "TDoA Anchor V2", "锚点，最多 8 个；TDoA3 异常时兜底",   "0"),
+    ("twr-anchor", "TWR Anchor",     "双向测距锚点",                        "0"),
+    ("twr-tag",    "TWR Tag",        "官方 TWR 标签（一次只能一个，只输出距离）", "20"),
+]
+
+
+def mode_note(mode):
+    for k, _n, note, _i in MODE_MENU:
+        if k == mode:
+            return note
+    return ""
+
+
+def default_id_for(mode):
+    for k, _n, _note, dflt in MODE_MENU:
+        if k == mode:
+            return dflt
+    return "0"
+
+
+def label_for(mode):
+    return {
+        "tdoa3": "基站 / 锚点",
+        "tdoa2": "基站 / 锚点(TDoA2)",
+        "sniffer": "数据出口(纯监听)",
+        "twr-anchor": "TWR 锚点",
+        "twr-tag": "TWR 标签",
+    }.get(mode, mode)
+
+
+def ask_mode(default="tdoa3", supported=None):
+    """让用户选择要配置的模式 —— 覆盖官方固件支持的全部模式。
+
+    supported: 已探测到的固件支持的模式名列表；为 None 表示未知（不标注）。
+    """
+    print("  可选模式（官方固件支持的全部模式）：")
+    for i, (key, name, note, _dflt) in enumerate(MODE_MENU):
+        marks = ""
+        if key == default:
+            marks += "   ← 默认"
+        if supported is not None and name not in supported:
+            marks += "   [当前固件不支持]"
+        print("    [%d] %-16s %s%s" % (i + 1, name, note, marks))
+    idx = [i for i, (k, _n, _x, _d) in enumerate(MODE_MENU) if k == default]
+    dflt = str((idx[0] + 1) if idx else 1)
+    sel = ask("选择模式", dflt)
+    try:
+        return MODE_MENU[int(sel) - 1][0]
+    except Exception:
+        warn("选择无效，使用默认模式 %s" % MODE_NAME[default])
+        return default
 
 WARN_FLASHING = (
     "  ⚠ 刷写期间：不要拔 USB、不要按 Reset、不要打开官方 GUI（它会抢设备）\n"
@@ -106,13 +164,19 @@ def pause(msg="按回车返回菜单 ..."):
 def scan():
     """扫描当前硬件状态，返回 dict"""
     snap = {
-        "ports": [],         # 正常运行模式的 LPS Node 串口
+        "nodes": [],         # 正常运行模式的 LPS Node（含固件能力探测结果）
         "dfu": None,         # bState 或 None
         "usb_nodes": 0,      # USB 上能看到的 0483:5740 数量
         "driver_trouble": False,
     }
     try:
-        snap["ports"] = F.find_node_ports()
+        for p in F.find_node_ports():
+            fw = None
+            try:
+                fw = C.probe_firmware(p.device, quiet=True)
+            except Exception:
+                fw = None
+            snap["nodes"].append({"device": p.device, "desc": p.description, "fw": fw})
     except Exception:
         pass
     try:
@@ -128,17 +192,31 @@ def scan():
             usb.core.find(find_all=True, idVendor=F.NODE_VID, idProduct=F.NODE_PID) or []))
     except Exception:
         pass
-    snap["driver_trouble"] = (snap["usb_nodes"] > 0 and not snap["ports"])
+    snap["driver_trouble"] = (snap["usb_nodes"] > 0 and not snap["nodes"])
     return snap
+
+
+def fw_text(fw):
+    """把探测结果压成一行短描述"""
+    if not fw:
+        return "固件能力未知"
+    node_id = fw.get("address", fw.get("id", "?"))
+    if fw.get("has_tdoa3"):
+        extra = " 当前: %s / ID %s" % (fw.get("mode", "?"), node_id)
+        return "固件 OK（支持 TDoA3，%d 种模式）%s" % (len(fw.get("modes", [])), extra)
+    if fw.get("has_tdoa2"):
+        return "固件偏旧（只有 TDoA2，无 TDoA3，当前 ID %s）→ 需要刷固件" % node_id
+    return "固件过旧（连 TDoA2 都没有）→ 需要刷固件"
 
 
 def render(snap, message=None):
     print()
     hr("LPS Node 配置向导")
     print("  当前状态：")
-    if snap["ports"]:
-        for p in snap["ports"]:
-            print("    ● 串口节点 : %-8s %s" % (p.device, p.description))
+    if snap["nodes"]:
+        for n in snap["nodes"]:
+            print("    ● 串口节点 : %-8s %s" % (n["device"], n["desc"]))
+            print("                  %s" % fw_text(n["fw"]))
     else:
         print("    ○ 串口节点 : 无（节点要处于运行模式才会出现 COM 口）")
     if snap["dfu"] is None:
@@ -157,12 +235,13 @@ def render(snap, message=None):
             print("  " + line)
     print()
     hr()
-    print("  [1] 刷固件 + 配置为【基站】      (TDoA Anchor V3)")
-    print("  [2] 刷固件 + 配置为【标签/数据出口】(Sniffer)")
-    print("  [3] 只配置（不刷固件）")
-    print("  [4] 查看节点当前配置")
-    print("  [5] 重新扫描 / 诊断")
-    print("  [6] 恢复卡住的 DFU 设备")
+    print("  [1] 刷固件 + 配置为【基站】      (TDoA Anchor V3)   ← 本项目常用")
+    print("  [2] 刷固件 + 配置为【数据出口】  (Sniffer)          ← 本项目常用")
+    print("  [3] 刷固件 + 配置为【其它模式】  (TWR / TDoA2 等全部官方模式)")
+    print("  [4] 只配置（不刷固件）           ← 固件已 OK 时用这个，几秒钟完成")
+    print("  [5] 查看节点当前配置")
+    print("  [6] 重新扫描 / 诊断")
+    print("  [7] 恢复卡住的 DFU 设备")
     print("  [q] 退出")
     hr()
 
@@ -353,22 +432,54 @@ def do_configure(port, node_id, mode):
 # ---------------------------------------------------------------------------
 # 动作：一键（刷 + 配）
 # ---------------------------------------------------------------------------
-def action_flash_and_config(role):
-    mode = "tdoa3" if role == "anchor" else "sniffer"
-    label = "基站" if role == "anchor" else "标签/数据出口"
-    default_id = "0" if role == "anchor" else "20"
+def action_flash_and_config(preset_mode=None):
+    mode = preset_mode if preset_mode else ask_mode()
+    label = label_for(mode)
+    default_id = default_id_for(mode)
 
-    hr("刷固件 + 配置为【%s】（模式 %s）" % (label, MODE_NAME[mode]))
+    hr("刷固件 + 配置为【%s】" % label)
+    info("目标模式：%s —— %s" % (MODE_NAME[mode], mode_note(mode)))
     snap = scan()
 
-    # 没有 DFU 设备时，尽量帮忙进入
-    if snap["dfu"] is None:
-        if len(snap["ports"]) == 1:
-            ans = ask("没有 DFU 设备。是否让脚本通过串口把 %s 送进 DFU？(y/n)"
-                      % snap["ports"][0].device, "y")
+    # ① 节点正在运行：先看固件能不能直接用，能就直接配置，无需刷固件
+    if snap["dfu"] is None and snap["nodes"]:
+        target = None
+        if len(snap["nodes"]) == 1:
+            target = snap["nodes"][0]
+        else:
+            for i, n in enumerate(snap["nodes"]):
+                print("    [%d] %s  %s" % (i + 1, n["device"], fw_text(n["fw"])))
+            sel = ask("选择要配置的节点序号", "1")
+            try:
+                target = snap["nodes"][int(sel) - 1]
+            except Exception:
+                err("序号无效")
+                return
+        fw = target["fw"]
+        info("%s → %s" % (target["device"], fw_text(fw)))
+        if fw and fw.get("has_tdoa3"):
+            ans = ask("该节点固件已支持 TDoA3，【跳过刷固件】直接配置？(y/n)", "y")
             if ans.lower().startswith("y"):
-                info("向 %s 发送 'u' ..." % snap["ports"][0].device)
-                F.enter_dfu(snap["ports"][0].device, quiet=True)
+                node_id = ask("要设置的编号 ID (0-255)", default_id)
+                try:
+                    node_id = int(node_id)
+                    assert 0 <= node_id <= 255
+                except Exception:
+                    err("编号必须是 0-255 的整数")
+                    return
+                do_configure(target["device"], node_id, mode)
+                return
+        elif fw is not None:
+            warn("这块节点的固件不支持 TDoA3，需要先刷固件")
+
+    # ② 走刷写流程：需要有 DFU 设备
+    if snap["dfu"] is None:
+        if len(snap["nodes"]) == 1:
+            ans = ask("没有 DFU 设备。是否让脚本通过串口把 %s 送进 DFU？(y/n)"
+                      % snap["nodes"][0]["device"], "y")
+            if ans.lower().startswith("y"):
+                info("向 %s 发送 'u' ..." % snap["nodes"][0]["device"])
+                F.enter_dfu(snap["nodes"][0]["device"], quiet=True)
                 time.sleep(1.0)
                 snap = scan()
         if snap["dfu"] is None:
@@ -403,7 +514,7 @@ def action_flash_and_config(role):
 def action_config_only():
     hr("只配置（不刷固件）")
     snap = scan()
-    if not snap["ports"]:
+    if not snap["nodes"]:
         if snap["driver_trouble"]:
             err("USB 上有节点但没有 COM 口 —— 驱动被 libusb/Zadig 抢占了")
             print("       解决：设备管理器 → libusb-win32 devices → 'Crazyflie 2.x (Interface 0)'")
@@ -413,22 +524,21 @@ def action_config_only():
             print("       板子刚上电时若停在 DFU，请拔掉 USB 后【不按键】重新插上")
         return
 
-    if len(snap["ports"]) == 1:
-        port = snap["ports"][0].device
+    if len(snap["nodes"]) == 1:
+        port = snap["nodes"][0]["device"]
         info("自动选中串口 %s" % port)
     else:
-        for i, p in enumerate(snap["ports"]):
-            print("    [%d] %s  %s" % (i + 1, p.device, p.description))
+        for i, n in enumerate(snap["nodes"]):
+            print("    [%d] %s  %s  %s" % (i + 1, n["device"], n["desc"], fw_text(n["fw"])))
         sel = ask("选择节点序号", "1")
         try:
-            port = snap["ports"][int(sel) - 1].device
+            port = snap["nodes"][int(sel) - 1]["device"]
         except Exception:
             err("序号无效")
             return
 
-    role = ask("配置为 基站(a) / 标签(t) ?", "a").lower()[:1]
-    mode = "tdoa3" if role == "a" else "sniffer"
-    default_id = "0" if role == "a" else "20"
+    mode = ask_mode()
+    default_id = default_id_for(mode)
     node_id = ask("编号 ID (0-255)", default_id)
     try:
         node_id = int(node_id)
@@ -523,21 +633,24 @@ def main():
 
         try:
             if choice == "1":
-                action_flash_and_config("anchor")
+                action_flash_and_config("tdoa3")
                 last_msg = "上一步：刷固件并配置为【基站】"
             elif choice == "2":
-                action_flash_and_config("tag")
-                last_msg = "上一步：刷固件并配置为【标签/数据出口】"
+                action_flash_and_config("sniffer")
+                last_msg = "上一步：刷固件并配置为【数据出口】"
             elif choice == "3":
+                action_flash_and_config(None)
+                last_msg = "上一步：刷固件并配置为【自选模式】"
+            elif choice == "4":
                 action_config_only()
                 last_msg = "上一步：只配置"
-            elif choice == "4":
+            elif choice == "5":
                 action_read()
                 last_msg = "上一步：查看配置"
-            elif choice == "5":
+            elif choice == "6":
                 action_diagnose()
                 last_msg = "上一步：诊断"
-            elif choice == "6":
+            elif choice == "7":
                 action_recover()
                 last_msg = "上一步：DFU 恢复"
             elif choice in ("q", "quit", "exit"):

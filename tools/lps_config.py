@@ -118,6 +118,42 @@ def read_banner(ser, seconds=1.5):
     return buf.decode("utf-8", "replace")
 
 
+def read_banner_until(ser, timeout=3.5):
+    """可靠地读完整个开机横幅。
+
+    节点是在 USB 串口"被连接"之后、由主循环里的 usbcommPrintWelcomeMessage()
+    才把横幅打出来的，实测要 1~2 秒才到；固定读 1 秒会漏掉前半段。
+    这里改成读到结束标志（"Press 'h' for help" / "Node started"）或超时。
+    """
+    end = time.time() + timeout
+    buf = b""
+    while time.time() < end:
+        chunk = ser.read(4096)
+        if chunk:
+            buf += chunk
+            if b"Press 'h' for help" in buf or b"Node started" in buf:
+                time.sleep(0.1)
+                tail = ser.read(4096)
+                if tail:
+                    buf += tail
+                break
+        else:
+            time.sleep(0.02)
+    return buf.decode("utf-8", "replace")
+
+
+def read_config_text(port, timeout=3.5):
+    """打开串口读一次完整开机横幅，返回文本（失败返回 None）"""
+    try:
+        ser = open_port(port)
+    except SystemExit:
+        return None
+    try:
+        return read_banner_until(ser, timeout)
+    finally:
+        ser.close()
+
+
 def parse_banner(text):
     cfg = {}
     m = re.search(r"Address is 0x([0-9A-Fa-f]+)", text)
@@ -144,7 +180,7 @@ def parse_banner(text):
 def show_config(port, quiet=False):
     ser = open_port(port)
     try:
-        text = read_banner(ser)
+        text = read_banner_until(ser)
     finally:
         ser.close()
     cfg = parse_banner(text)
@@ -161,6 +197,74 @@ def show_config(port, quiet=False):
             print("  (没读到配置输出，原始内容如下)")
             print(text.strip()[:500])
     return cfg
+
+
+def probe_firmware(port, quiet=False):
+    """探测节点固件能力：让节点打印它支持的模式列表。
+
+    为什么不用版本号？—— LPS Node 固件**不输出版本号**（既没有 version 命令，
+    开机横幅也不带），所以只能靠"能力探测"：
+        菜单 'm' 会列出固件里注册的全部模式，
+        出现 "TDoA Anchor V3" 就说明固件 ≥ 2018.10（TDoA3 从这版开始进入官方固件）。
+
+    注意：'m' 会让节点停在模式选择菜单，所以必须再发一个无效字符让它退回主菜单。
+    """
+    ser = open_port(port)
+    try:
+        banner = read_banner_until(ser, 3.0)  # 开机横幅里带当前 编号/模式
+        ser.write(b"m")
+        ser.flush()
+        time.sleep(0.4)
+        text = read_banner(ser, 0.8)
+        ser.write(b"x")                       # 无效选择 → 节点打印 Incorrect mode 并回主菜单
+        ser.flush()
+        time.sleep(0.3)
+        text += read_banner(ser, 0.5)
+    finally:
+        ser.close()
+
+    seen, has_tdoa3, has_tdoa2 = parse_mode_list(text)
+    cfg = parse_banner(banner)
+
+    if not quiet:
+        print("=== %s 固件能力探测 ===" % port)
+        if not seen:
+            print("  (没读到模式列表，原始输出如下)")
+            print(text.strip()[:400])
+        else:
+            print("  支持 %d 种模式：" % len(seen))
+            for i, name in enumerate(seen):
+                print("    %d - %s" % (i, name))
+            print()
+            if has_tdoa3:
+                print("  → [OK] 支持 TDoA3，固件可直接使用（≥ 2018.10），**无需刷固件**")
+                print("         直接配置即可：python tools\\lps_config.py --port %s --id N --mode tdoa3" % port)
+            elif has_tdoa2:
+                print("  → [旧] 只支持 TDoA2（2018.10 之前的固件）")
+                print("         要么刷 2022.09 固件用 TDoA3，要么整套系统改用 TDoA2")
+            else:
+                print("  → [过旧] 连 TDoA2 都没有（很早期的固件），必须刷固件")
+    cfg.update({"modes": seen, "has_tdoa3": has_tdoa3, "has_tdoa2": has_tdoa2,
+                "raw": banner + "\n" + text})
+    return cfg
+
+
+def parse_mode_list(text):
+    """从 'm' 菜单的输出里解析出支持的模式列表。
+
+    节点源码（src/main.c printModeList）打印格式为：
+        Available UWB modes:
+         0 - TWR Anchor
+         4 - TDoA Anchor V3 (Current mode)
+    """
+    modes = []
+    for m in re.finditer(r"^\s*(\d+)\s*-\s*(.+?)\s*(\(\s*Current mode\s*\))?\s*$", text, re.M):
+        name = m.group(2).strip()
+        if name and name not in modes:
+            modes.append(name)
+    has_tdoa3 = any("TDoA Anchor V3" in x for x in modes)
+    has_tdoa2 = any("TDoA Anchor V2" in x for x in modes)
+    return modes, has_tdoa3, has_tdoa2
 
 
 def send_keys(ser, keys, gap=0.10):
@@ -274,6 +378,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="列出在线节点")
     ap.add_argument("--port", help="节点串口，例如 COM5；不指定则自动识别")
     ap.add_argument("--read", action="store_true", help="只读取并显示当前配置")
+    ap.add_argument("--probe", action="store_true",
+                    help="探测固件能力：列出节点支持的模式（判断是否需要刷固件）")
     ap.add_argument("--id", type=int, help="设置节点 ID（0-255）")
     ap.add_argument("--mode", choices=sorted(MODE_KEYS), help="设置工作模式")
     ap.add_argument("--radio", type=int, help="设置射频模式档位（菜单 r 的数字）")
@@ -290,6 +396,10 @@ def main():
         for p in nodes:
             print("  %-8s %s" % (p.device, p.description))
         usb_driver_diagnostic()
+        return
+
+    if args.probe:
+        probe_firmware(pick_port(args.port))
         return
 
     if args.assign:

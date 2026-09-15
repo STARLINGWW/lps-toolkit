@@ -57,9 +57,56 @@ python tools\lps_wizard.py
 ```
 
 It scans for COM ports and DFU devices, then offers a menu: flash as **anchor**,
-flash as **data-output node**, configure only, inspect, diagnose, or recover a
-stuck DFU device. **It returns to the menu after every step**, so you can walk
-through a whole batch of nodes without typing any parameters.
+flash as **data-output node**, flash with **any other official mode**, configure
+only, inspect, diagnose, or recover a stuck DFU device. **It returns to the menu
+after every step**, so you can walk through a whole batch of nodes without typing
+any parameters.
+
+The status line also reports what the attached node's firmware can do, and the
+mode picker covers **all five modes the official firmware supports**
+(`TDoA Anchor V3`, `Sniffer`, `TDoA Anchor V2`, `TWR Anchor`, `TWR Tag`).
+
+## Do I have to flash every time? (No)
+
+Anchors, tags and data-output nodes all run **the same firmware**. The role is
+just an EEPROM setting (the *mode*), so once a board has been flashed you can
+switch it between anchor / data-output / any other mode **by configuration
+alone** — a few seconds, no flashing.
+
+You only need to flash when:
+
+1. the board is new and its factory firmware is old,
+2. the firmware predates **2018.10** (TDoA3 entered the official firmware then, so older builds have no `TDoA Anchor V3`),
+3. the firmware got damaged (interrupted flash), or
+4. you want to upgrade the version.
+
+### How the toolkit decides whether a firmware is usable
+
+LPS Node firmware **does not print a version number** (there is no version
+command and the boot banner has none — the two version fields in `cfg.c` are the
+*config format* version). This toolkit therefore probes **capability** instead:
+it asks the node to list the modes it supports.
+
+```powershell
+python tools\lps_config.py --port COMx --probe
+```
+
+```
+  支持 5 种模式:
+    0 - TWR Anchor      3 - TDoA Anchor V2
+    1 - TWR Tag         4 - TDoA Anchor V3   <-- TDoA3 = firmware >= 2018.10
+    2 - Sniffer
+  -> usable as-is, no flashing required
+```
+
+| Modes reported | Firmware era | Verdict |
+|---|---|---|
+| 5 (includes `TDoA Anchor V3`) | ≥ 2018.10 | configure directly, no flashing |
+| 4 (V2 but no V3) | before 2018.10 | flash to get TDoA3, or run the system in TDoA2 |
+| 3 (TWR/Sniffer only) | very early | must flash |
+
+The wizard runs this probe on every scan and tells you the verdict in its status
+line, then offers to skip flashing when the firmware is already fine.
 
 ## Three kinds of commands
 
@@ -69,9 +116,13 @@ plugging in USB):
 ```powershell
 python tools\lps_provision.py --anchor 2      # flash + set ID 2 + TDoA Anchor V3
 python tools\lps_provision.py --tag 20        # flash + set ID 20 + Sniffer
+python tools\lps_provision.py --anchor 0 --mode twr-anchor   # any official mode
 python tools\lps_provision.py --anchors 0-7   # interactive batch, IDs 0..7
 python tools\lps_flash.py --no-enter          # firmware only
 ```
+
+Supported modes for `--mode` / the wizard: `tdoa3`, `sniffer`, `tdoa2`,
+`twr-anchor`, `twr-tag`.
 
 **Configure** (takes effect after a reset — press the `RESET` button or replug):
 
@@ -208,8 +259,50 @@ python tools\lps_wizard.py
 ```
 
 自动扫描 COM 口与 DFU 设备，然后给你菜单：刷成基站 / 刷成数据出口 / 只配置 /
-查看 / 诊断 / 恢复卡住的 DFU。**每做完一步都回到菜单**，所以整批节点可以一路点下去，
-不用记参数、不用手打 COM 号。
+刷成其它官方模式 / 只配置 / 查看 / 诊断 / 恢复卡住的 DFU。
+**每做完一步都回到菜单**，所以整批节点可以一路点下去，不用记参数、不用手打 COM 号。
+
+状态栏会直接显示当前节点的固件能力；模式选择里包含**官方固件支持的全部 5 种模式**
+（`TDoA Anchor V3`、`Sniffer`、`TDoA Anchor V2`、`TWR Anchor`、`TWR Tag`）。
+
+## 每次都要刷固件吗？（不需要）
+
+基站、标签、数据出口用的是**同一份固件**，角色只是 EEPROM 里的一个"模式"配置。
+所以**一块板子刷过一次固件之后，改成基站 / 数据出口 / 其它模式都只需要改配置**，
+几秒钟完成，不用再刷。
+
+只有这几种情况才需要刷固件：
+
+1. 新板第一次使用（出厂固件可能很旧）
+2. 固件早于 **2018.10**（TDoA3 从这一版才进入官方固件，更早的固件没有 `TDoA Anchor V3`）
+3. 固件损坏（刷写中断、异常掉电）
+4. 想升级版本（例如统一到 2022.09）
+
+### 怎么判断固件能不能直接用
+
+LPS Node 固件**不输出任何版本号**（没有 version 命令，开机横幅里也没有；
+`cfg.c` 里那两个版本字段是*配置格式*的版本，不是固件版本）。
+所以本工程改用**能力探测**——让节点把支持的模式列表打出来：
+
+```powershell
+python tools\lps_config.py --port COMx --probe
+```
+
+```
+  支持 5 种模式：
+    0 - TWR Anchor      3 - TDoA Anchor V2
+    1 - TWR Tag         4 - TDoA Anchor V3   ← 有它就说明固件 ≥ 2018.10
+    2 - Sniffer
+  → [OK] 支持 TDoA3，固件可直接使用，无需刷固件
+```
+
+| 探测到的模式数 | 固件年代 | 结论 |
+|---|---|---|
+| 5 种（含 `TDoA Anchor V3`） | ≥ 2018.10 | **直接配置，无需刷固件** |
+| 4 种（有 V2 无 V3） | 2018.10 之前 | 要 TDoA3 就得刷固件；或整套改用 TDoA2 |
+| 3 种（只有 TWR/Sniffer） | 很早期 | 必须刷固件 |
+
+向导每次扫描都会自动探测，并在状态栏给出结论；固件已经 OK 时会问你要不要跳过刷固件。
 
 ## 三类命令
 
@@ -218,9 +311,12 @@ python tools\lps_wizard.py
 ```powershell
 python tools\lps_provision.py --anchor 2      # 刷 + 编号 2 + TDoA Anchor V3
 python tools\lps_provision.py --tag 20        # 刷 + 编号 20 + Sniffer
+python tools\lps_provision.py --anchor 0 --mode twr-anchor   # 官方任意模式
 python tools\lps_provision.py --anchors 0-7   # 交互式批量，编号 0~7
 python tools\lps_flash.py --no-enter          # 只刷固件
 ```
+
+`--mode` 与向导支持的模式：`tdoa3`、`sniffer`、`tdoa2`、`twr-anchor`、`twr-tag`。
 
 **配置**（改完按 `RESET` 键或拔插 USB 才生效）：
 
