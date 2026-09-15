@@ -307,11 +307,34 @@ def jacobian(p, meas, pos, h=1e-3):
     return J
 
 
-def solve_position(meas, pos, p0, iterations=25):
+def solve_position(meas, pos, p0, iterations=25, fix_z=None, max_step=1.0):
+    """高斯-牛顿 + Huber 鲁棒核 + 粗差剔除。
+
+    fix_z   : 固定高度（米）→ 真正的二维解算（只优化 x/y）。
+              锚点几乎共面时 z 方向是病态的，必须用这个（或改用 3D 布点）。
+    max_step: 单次迭代步长上限（米）。防止病态几何/坏初值时跑到无穷远。
+    """
     p = np.array(p0, dtype=float)
+    if fix_z is not None:
+        p[2] = float(fix_z)
+    n_free = 2 if fix_z is not None else 3
+
+    def resid_free(x):
+        q = np.array([x[0], x[1], 0.0]) if fix_z is not None else x
+        if fix_z is not None:
+            q[2] = float(fix_z)
+        return residuals(q, meas, pos)
+
     for _ in range(iterations):
-        r = residuals(p, meas, pos)
-        J = jacobian(p, meas, pos)
+        r = resid_free(p[:n_free] if fix_z is not None else p)
+        # 数值雅可比（只对自由变量求导）
+        J = np.empty((len(meas), n_free))
+        for axis in range(n_free):
+            dx_ = np.zeros(n_free)
+            dx_[axis] = 1e-3
+            xp = (p[:n_free] if fix_z is not None else p) + dx_
+            xm = (p[:n_free] if fix_z is not None else p) - dx_
+            J[:, axis] = (resid_free(xp) - resid_free(xm)) / 2e-3
         # Huber 权重，抑制个别坏测量把解拉飞
         a = np.abs(r)
         w = np.ones_like(a)
@@ -323,8 +346,16 @@ def solve_position(meas, pos, p0, iterations=25):
             dx, *_ = np.linalg.lstsq(Jw, -rw, rcond=None)
         except np.linalg.LinAlgError:
             return None, None
-        p = p + dx
-        if np.linalg.norm(dx) < 1e-4:
+        step = float(np.linalg.norm(dx))
+        if step > max_step:                 # 限制步长，防止发散
+            dx = dx * (max_step / step)
+        if fix_z is not None:
+            p[0] += dx[0]
+            p[1] += dx[1]
+            p[2] = float(fix_z)
+        else:
+            p = p + dx
+        if step < 1e-4:
             break
     r = residuals(p, meas, pos)
     keep = np.abs(r) < OUTLIER_GATE_M
@@ -334,6 +365,21 @@ def solve_position(meas, pos, p0, iterations=25):
         r2 = residuals(p, [m for m, k in zip(meas, keep) if k], pos)
         return p, float(np.sqrt(np.mean(r2 ** 2)))
     return p, float(np.sqrt(np.mean(r ** 2)))
+
+
+def solve_2d_with_height_search(meas, pos, p0, z_min=0.0, z_max=2.5, z_step=0.05):
+    """锚点接近共面时的稳妥做法：扫一遍高度，取残差最小的那个高度做二维解。
+
+    返回 (p, rms, z_used)；失败返回 (None, None, None)。
+    """
+    best = (None, None, None)
+    z = z_min
+    while z <= z_max + 1e-9:
+        p, rms = solve_position(meas, pos, p0, fix_z=z)
+        if p is not None and (best[1] is None or rms < best[1]):
+            best = (p.copy(), rms, z)
+        z += z_step
+    return best
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +409,9 @@ def main():
     ap.add_argument("--anchors", required=True, help="锚点坐标 YAML")
     ap.add_argument("--check", action="store_true", help="只做解码自检并打印统计")
     ap.add_argument("--json", action="store_true", help="以 JSON 行输出位置")
-    ap.add_argument("--z", type=float, help="固定高度（近似 2D 定位），单位米")
+    ap.add_argument("--z", default=None,
+                    help="固定高度（米）做二维定位；填 auto 则自动搜索最佳高度"
+                         "（锚点接近共面时推荐，例如 --z auto）")
     ap.add_argument("--rate", type=float, default=10.0, help="位置输出频率上限 Hz（默认 10）")
     ap.add_argument("--sign", type=float, default=1.0, choices=[1.0, -1.0],
                     help="TDoA 符号约定翻转（若位置明显镜像，改成 -1 试试）")
@@ -387,6 +435,7 @@ def main():
     prev = dict(stats)
     pending = []
     pos = None
+    auto_z = [None]          # --z auto 时缓存搜索到的高度
     last_out = None
     t_start = None
     last_report = None
@@ -451,10 +500,24 @@ def main():
                         pos0[2] = pos0[2] * 0.5
                     else:
                         pos0 = pos
-                    p, rms = solve_position(meas, anchor_pos, pos0)
+                    z_used = None
+                    if args.z == "auto":
+                        if auto_z[0] is None:                 # 只在第一帧搜索一次，之后复用
+                            pz, rz, zbest = solve_2d_with_height_search(meas, anchor_pos, pos0)
+                            if pz is not None:
+                                auto_z[0] = zbest
+                                print("# 自动搜索到最佳高度 z = %.2f m（后续沿用）" % zbest)
+                        if auto_z[0] is not None:
+                            z_used = auto_z[0]
+                            p, rms = solve_position(meas, anchor_pos, pos0, fix_z=z_used)
+                        else:
+                            p, rms = None, None
+                    elif args.z is not None:
+                        z_used = float(args.z)
+                        p, rms = solve_position(meas, anchor_pos, pos0, fix_z=z_used)
+                    else:
+                        p, rms = solve_position(meas, anchor_pos, pos0)
                     if p is not None:
-                        if args.z is not None:
-                            p[2] = args.z
                         pos = p
                         if args.json:
                             print(json.dumps({
