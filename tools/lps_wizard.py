@@ -131,6 +131,9 @@ S = {
         "enter_to_menu": "Press Enter to return to the main menu ...",
         "enter_to_continue": "Press Enter to continue ...",
         "invalid": "Invalid choice: %s",
+        "invalid_retry": "Invalid input: %s — please try again",
+        "hint_q": "(q = back)",
+        "back_to_menu": "Back to the main menu.",
         "mode_prompt": "Target mode:",
         "mode_shortcut": "[0] Tag / data output (Sniffer)      [1] Anchor / base (TDoA Anchor V3)      [2] More official modes",
         "mode_choose": "Select mode",
@@ -234,6 +237,9 @@ S = {
         "enter_to_menu": "按回车返回主界面 ...",
         "enter_to_continue": "按回车继续 ...",
         "invalid": "无效选择：%s",
+        "invalid_retry": "无效输入：%s —— 请重新输入",
+        "hint_q": "(q=返回主菜单)",
+        "back_to_menu": "已返回主界面。",
         "mode_prompt": "请选择节点配置模式：",
         "mode_shortcut": "[0] 标签 / 数据出口 (Sniffer)      [1] 基站 / 锚点 (TDoA Anchor V3)      [2] 更多官方模式",
         "mode_choose": "选择模式",
@@ -330,9 +336,61 @@ def err(m):
     print("  [ERR]  " + m)
 
 
+class Back(Exception):
+    """用户输入 q 要求返回上一级 —— 一路回退到主菜单。"""
+
+
+BACK_WORDS = ("q", "quit", "exit", "back", "b")
+
+
+def _read(prompt, hint=""):
+    try:
+        return input("  %s%s " % (prompt, hint)).strip()
+    except EOFError:
+        raise Back()          # 输入结束（管道/EOF）也当作返回，不要继续往下走
+
+
 def ask(prompt, default=""):
-    s = input("  %s%s: " % (prompt, (" [%s]" % default) if default else "")).strip()
-    return s if s else default
+    """普通提问：q 返回上一级；空回车取默认值。"""
+    raw = _read(prompt, (" [%s]" % default if default else "") + "  " + t("hint_q"))
+    if raw.lower() in BACK_WORDS:
+        raise Back()
+    return raw if raw else default
+
+
+def ask_choice(prompt, options, default=None):
+    """从 options（key -> 说明，可为 None）里选一个 key。
+
+    * 非法输入 → 提示后【留在本界面重新询问】，绝不继续往下走
+    * 输入 q → 抛 Back，返回主菜单
+    """
+    keys = list(options.keys())
+    while True:
+        hint = " [%s]  %s" % (default if default else "/".join(keys), t("hint_q"))
+        raw = _read(prompt, hint).lower()
+        if raw in BACK_WORDS:
+            raise Back()
+        if raw == "" and default:
+            return default
+        if raw in options:
+            return raw
+        warn(t("invalid_retry", raw))
+
+
+def confirm_yn(prompt, default="n"):
+    """y/n 询问：非法输入重问，q 返回上一级。"""
+    while True:
+        hint = " [%s]  %s" % ("Y/n" if default == "y" else "y/N", t("hint_q"))
+        raw = _read(prompt, hint).lower()
+        if raw in BACK_WORDS:
+            raise Back()
+        if raw == "":
+            raw = default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        warn(t("invalid_retry", raw))
 
 
 def disp_width(s):
@@ -346,19 +404,6 @@ def disp_width(s):
 def pad(s, width):
     s = str(s)
     return s + " " * max(0, width - disp_width(s))
-
-
-def confirm(prompt, default_no=True):
-    """显式确认：只接受 y/yes（或明确指定默认 yes 时的空回车）。"""
-    try:
-        s = input("  %s " % prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    if s in ("y", "yes"):
-        return True
-    if s == "" and not default_no:
-        return True
-    return False
 
 
 def pause():
@@ -487,39 +532,35 @@ def ask_mode(supported=None):
     print()
     print("  " + t("mode_prompt"))
     print("    " + t("mode_shortcut"))
-    sel = ask(t("mode_choose"), "1")
+    sel = ask_choice(t("mode_choose"), {"0": None, "1": None, "2": None}, default="1")
     if sel in SHORTCUT:
         return SHORTCUT[sel]
-    if sel == "2":
-        print()
-        print("  " + t("mode_more"))
-        for i, row in enumerate(MODE_TABLE):
-            key, name = row[0], row[1]
-            mark = ""
-            if supported is not None and name not in supported:
-                mark = "   " + t("mode_unsupported")
-            print("    [%d] %-16s %s%s" % (i + 1, name, mode_note(key), mark))
-        sel2 = ask(t("mode_choose"), "2")
-        try:
-            return MODE_TABLE[int(sel2) - 1][0]
-        except Exception:
-            warn(t("invalid", sel2))
-            return "tdoa3"
-    warn(t("invalid", sel))
-    return "tdoa3"
+    # sel == "2"：列出官方固件支持的全部模式
+    print()
+    print("  " + t("mode_more"))
+    opts = {}
+    for i, row in enumerate(MODE_TABLE):
+        key, name = row[0], row[1]
+        mark = ""
+        if supported is not None and name not in supported:
+            mark = "   " + t("mode_unsupported")
+        print("    [%d] %s%s%s" % (i + 1, pad(name, 18), mode_note(key), mark))
+        opts[str(i + 1)] = None
+    sel2 = ask_choice(t("mode_choose"), opts, default="2")
+    return MODE_TABLE[int(sel2) - 1][0]
 
 
 def ask_id(mode):
     dflt = mode_default_id(mode)
     while True:
-        s = ask(t("id_prompt"), dflt)
-        try:
-            v = int(s)
-            if 0 <= v <= 255:
-                return v
-        except Exception:
-            pass
-        warn(t("id_bad"))
+        raw = _read(t("id_prompt"), " [%s]  %s" % (dflt, t("hint_q")))
+        if raw.lower() in BACK_WORDS:
+            raise Back()
+        if raw == "":
+            return int(dflt)
+        if raw.isdigit() and 0 <= int(raw) <= 255:
+            return int(raw)
+        warn(t("invalid_retry", raw if raw else t("id_bad")))
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +575,7 @@ def ensure_dfu(snap):
         return True
 
     if len(snap["nodes"]) == 1:
-        ans = ask(t("send_u", snap["nodes"][0]["device"]), "y")
-        if ans.lower().startswith("y"):
+        if confirm_yn(t("send_u", snap["nodes"][0]["device"]), default="y"):
             info("u -> %s" % snap["nodes"][0]["device"])
             F.enter_dfu(snap["nodes"][0]["device"], quiet=True)
             time.sleep(1.0)
@@ -558,7 +598,7 @@ def flash_fw():
         err("firmware not found: %s" % DEFAULT_FW)
         print("        Put the .dfu file into: %s" % FW_DIR)
         return False
-    if not confirm(t("start_flash"), default_no=True):
+    if not confirm_yn(t("start_flash"), default="n"):
         info("Cancelled - nothing was written.")
         return False
     try:
@@ -643,7 +683,7 @@ def action_flash(snap):
             print()
             warn(t("fw_already_ok"))
             print("        " + t("fw_already_ok2"))
-            if not ask(t("flash_anyway"), "n").lower().startswith("y"):
+            if not confirm_yn(t("flash_anyway"), default="n"):
                 info("OK - use menu [2] to change the configuration instead.")
                 return
             break
@@ -679,12 +719,9 @@ def action_config(snap):
     else:
         for i, n in enumerate(snap["nodes"]):
             print("    [%d] %s  %s" % (i + 1, n["device"], n["desc"]))
-        sel = ask(t("select"), "1")
-        try:
-            target = snap["nodes"][int(sel) - 1]
-        except Exception:
-            err(t("invalid", sel))
-            return
+        opts = {str(i + 1): None for i in range(len(snap["nodes"]))}
+        sel = ask_choice(t("select"), opts, default="1")
+        target = snap["nodes"][int(sel) - 1]
     port = target["device"]
     print()
     info(t("cfg_now"))
@@ -774,6 +811,9 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print("\n  " + t("bye"))
             return
+        except Back:
+            message = t("back_to_menu")
+            continue
         except BrokenPipeError:
             os._exit(0)
         except Exception as e:

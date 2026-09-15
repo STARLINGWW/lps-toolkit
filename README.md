@@ -92,6 +92,10 @@ walked through without typing any parameters. The status panel also tells you
 whether the attached node's firmware is already usable (see below), and the mode
 picker covers **all five modes the official firmware supports**.
 
+Navigation: at any prompt type **`q`** to go back to the main menu (nothing is
+written), an invalid value simply re-asks the same question, and Enter accepts
+the default shown in brackets.
+
 Safety notes: flashing only starts after an explicit `y`; an interrupted or
 aborted flash cannot brick a node (the DFU bootloader is in ROM).
 
@@ -310,6 +314,9 @@ python tools\lps_wizard.py
 **[2] 改配置**流程：先显示当前配置 → 选模式 → 输入编号 → 写入 → 按 RESET → 回读校验。
 
 **每做完一步都回到菜单**，所以整批节点可以一路点下去，不用记参数、不用手打 COM 号。
+
+导航约定：任意提示处输入 **`q`** 返回主界面（不会写入任何东西）；输入非法值会**留在
+当前界面重新询问**，不会继续往下走；带默认值的提示直接回车即用默认值（默认值在方括号里）。
 
 状态栏会直接显示当前节点的固件能力；模式选择里包含**官方固件支持的全部 5 种模式**
 （`TDoA Anchor V3`、`Sniffer`、`TDoA Anchor V2`、`TWR Anchor`、`TWR Tag`）。
