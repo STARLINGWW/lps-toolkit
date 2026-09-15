@@ -351,16 +351,20 @@ def flash_file(dfu_cls, fw_path, quiet=False):
         if pct != state["lastpct"]:
             state["lastpct"] = pct
             if not quiet:
-                elapsed = time.time() - t0
-                eta = ""
-                if fraction > 0.02:
-                    left = elapsed / fraction - elapsed
-                    eta = "  已用 %d:%02d  剩余约 %d:%02d" % (
-                        int(elapsed) // 60, int(elapsed) % 60,
-                        int(left) // 60, int(left) % 60)
-                bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
-                sys.stdout.write("\r    %s [%s] %3d%%%s" % (name, bar, pct, eta))
-                sys.stdout.flush()
+                # 输出被下游关闭（例如 head / Select-Object -First）时不能影响刷写本身
+                try:
+                    elapsed = time.time() - t0
+                    eta = ""
+                    if fraction > 0.02:
+                        left = elapsed / fraction - elapsed
+                        eta = "  已用 %d:%02d  剩余约 %d:%02d" % (
+                            int(elapsed) // 60, int(elapsed) % 60,
+                            int(left) // 60, int(left) % 60)
+                    bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
+                    sys.stdout.write("\r    %s [%s] %3d%%%s" % (name, bar, pct, eta))
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    state["quiet_output"] = True
 
     print("--> 烧写 %s（%d 字节）" % (fw_path.name, fw_path.stat().st_size))
     try:

@@ -1,10 +1,12 @@
-# UWB TDoA Kit for Bitcraze Loco Positioning Nodes
+# lps-toolkit — flash, configure and use Bitcraze LPS Nodes
 
 **English** | [中文说明](#中文说明)
 
 A self-contained toolkit to **flash, configure and put Bitcraze Loco Positioning
-Nodes (LPS Node) into service as a TDoA positioning system** — without a
-Crazyflie, without a Loco Positioning Deck, and without patching any firmware.
+Nodes (LPS Node) into service** — without a Crazyflie, without a Loco Positioning
+Deck, and without patching any firmware. It covers everyday node maintenance
+(ID, mode, firmware version) and can build a complete TDoA positioning system
+with a passive sniffer node plus a host-side solver.
 
 ```
  ┌───────────────────────────┐
@@ -50,21 +52,48 @@ Expected: position `(2.700, 2.199, 0.998)` against a ground truth of
 software chain (frame parsing, TDoA3 decoding, clock correction, TDoA,
 multilateration) before any radio is involved.
 
-## The interactive wizard (recommended entry point)
+## Interactive console (recommended entry point)
 
 ```powershell
 python tools\lps_wizard.py
 ```
 
-It scans for COM ports and DFU devices, then offers a menu: flash as **anchor**,
-flash as **data-output node**, flash with **any other official mode**, configure
-only, inspect, diagnose, or recover a stuck DFU device. **It returns to the menu
-after every step**, so you can walk through a whole batch of nodes without typing
-any parameters.
+**English by default — press `0` to switch between EN / CN at any time.**
 
-The status line also reports what the attached node's firmware can do, and the
-mode picker covers **all five modes the official firmware supports**
-(`TDoA Anchor V3`, `Sniffer`, `TDoA Anchor V2`, `TWR Anchor`, `TWR Tag`).
+```
+==================================================================
+  LPS node console
+  lps-toolkit — flash / configure / inspect Bitcraze LPS Nodes
+==================================================================
+  Status
+    COM scan      : run-mode node(s): COM20
+    COM20    firmware OK: 5 modes incl. TDoA3   current: Sniffer / ID 0   [no flashing needed]
+    DFU device    : none
+==================================================================
+  [0] Language: EN   (press 0 to switch EN/CN)
+  [1] Flash firmware (est. 10 min+)
+  [2] Configure only (no flashing)
+  [3] Show current node configuration
+  [4] COM scan / diagnostics
+  [5] Recover an interrupted DFU device
+  [q] Quit
+```
+
+Flow of **[1] Flash firmware**: pick mode (`0` tag · `1` anchor · `2` more modes)
+→ set ID → read the flashing notes → **type `y` to really start** → progress with
+elapsed/ETA → the node reboots → configuration is written → press RESET to apply →
+the console reads the configuration back and prints the result.
+
+Flow of **[2] Configure only**: shows the node's current configuration first, then
+mode → ID → write → RESET → read-back verification.
+
+**It returns to the menu after every step**, so a whole batch of nodes can be
+walked through without typing any parameters. The status panel also tells you
+whether the attached node's firmware is already usable (see below), and the mode
+picker covers **all five modes the official firmware supports**.
+
+Safety notes: flashing only starts after an explicit `y`; an interrupted or
+aborted flash cannot brick a node (the DFU bootloader is in ROM).
 
 ## Do I have to flash every time? (No)
 
@@ -258,12 +287,33 @@ python tools\lps_tdoa3_solver.py --input captures\fake_tdoa3.bin --anchors captu
 python tools\lps_wizard.py
 ```
 
-自动扫描 COM 口与 DFU 设备，然后给你菜单：刷成基站 / 刷成数据出口 / 只配置 /
-刷成其它官方模式 / 只配置 / 查看 / 诊断 / 恢复卡住的 DFU。
+**默认英文界面，按 `0` 随时切换 中文 / EN。**
+
+```
+  COM 扫描结果  : 运行模式节点：COM20
+  COM20    固件 OK：5 种模式（含 TDoA3）  当前: Sniffer / ID 0  [无需刷固件]
+  DFU 设备    : 无
+  [0] 语言：中文   （按 0 切换 中文/EN）
+  [1] 刷固件（预计 10 分钟以上）
+  [2] 改配置（不刷固件）
+  [3] 查看当前节点配置
+  [4] COM 扫描 / 诊断
+  [5] 恢复意外中断的 DFU 设备
+  [q] 退出
+```
+
+**[1] 刷固件**流程：选模式（`0` 标签 · `1` 基站 · `2` 更多官方模式）→ 输入编号 →
+看刷写说明 → **必须输入 `y` 才真正开始** → 进度条（已用/剩余）→ 节点重启 →
+写入配置 → 提示按 RESET → 回读校验 → 显示"配置完成 + 当前配置"。
+
+**[2] 改配置**流程：先显示当前配置 → 选模式 → 输入编号 → 写入 → 按 RESET → 回读校验。
+
 **每做完一步都回到菜单**，所以整批节点可以一路点下去，不用记参数、不用手打 COM 号。
 
 状态栏会直接显示当前节点的固件能力；模式选择里包含**官方固件支持的全部 5 种模式**
 （`TDoA Anchor V3`、`Sniffer`、`TDoA Anchor V2`、`TWR Anchor`、`TWR Tag`）。
+
+安全提示：刷写必须显式输入 `y` 才会开始；中途中断也不会变砖（DFU 引导在芯片 ROM 里）。
 
 ## 每次都要刷固件吗？（不需要）
 

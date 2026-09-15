@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lps_wizard.py —— LPS Node 交互式配置向导（对话式 / 循环 / 状态机）
+lps_wizard.py — Loco Positioning System (LPS) node console
 
-设计目标：上电后就在 PowerShell 里对话式完成所有事，不用记参数。
+Interactive, bilingual (English / 中文) console for Bitcraze LPS Node:
 
     python tools\\lps_wizard.py
 
-它会自动检测 COM 口与 DFU 设备，然后给你一个菜单：
-    刷固件 + 配置成基站 / 标签、只配置、查看配置、诊断、恢复卡住的 DFU
-每做完一件事都回到菜单，方便一块接一块地配置（循环）。
+    [0] switch language (EN / CN)      [1] flash firmware
+    [2] configure only                [3] show current configuration
+    [4] COM scan / diagnostics        [5] recover an interrupted DFU device
 
-针对异常状态的处理（引导状态机）：
-    * 掉线 / 拔了线      → 提示重新插入，回到菜单
-    * DFU 卡在残留状态   → 给出"按住 DFU 键重新上电"的恢复指引
-    * 刷写中途失败       → 明确告知不会变砖，并给出恢复步骤
-    * 节点没出 COM 口    → 自动诊断是否是 libusb 抢占了 CDC 接口
-
-稳定性优先：刷写默认使用官方原速（严格按 STM32 上报的 5 秒等待，约 11 分钟/块）。
+Design notes
+------------
+* A node only exposes a serial port while it runs the application. In DFU mode
+  it appears as a USB DFU device instead, and never as a COM port.
+* Flashing uses the official timing by default (honouring the 5 s poll timeout
+  reported by the STM32 bootloader): about 10 minutes per board, and that is the
+  stable choice. Compressing the wait causes mid-flash failures.
+* An interrupted flash cannot brick a node: the DFU bootloader lives in ROM.
+  Recover with: unplug → hold BM & DFU → plug in → release.
 """
 
 import os
@@ -29,15 +31,16 @@ TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
-import lps_flash as F          # noqa: E402  (USB / DFU / 刷写)
-import lps_config as C         # noqa: E402  (串口配置 / 固件能力探测)
-
-# 载入 DfuSe 实现（lps-tools 或 clones/lps-tools）
-DFU_CLS, DFUSE = F.load_dfuse()
+import lps_flash as F          # noqa: E402  (USB / DFU / flashing)
+import lps_config as C         # noqa: E402  (serial console / capability probe)
 
 FW_DIR = ROOT / "firmware"
 DEFAULT_FW = FW_DIR / "lps-node-firmware-2022.09.dfu"
+PROJECT = "lps-toolkit"
 
+# ---------------------------------------------------------------------------
+# Mode tables
+# ---------------------------------------------------------------------------
 MODE_KEYS = {
     "tdoa3": [b"m", b"4"],
     "tdoa2": [b"m", b"3"],
@@ -52,82 +55,238 @@ MODE_NAME = {
     "twr-anchor": "TWR Anchor",
     "twr-tag": "TWR Tag",
 }
-
-# 官方固件支持的全部模式（顺序与节点菜单一致：0-4）
-#   key, 显示名, 用途说明, 编号建议
-MODE_MENU = [
-    ("tdoa3",      "TDoA Anchor V3", "基站/锚点 —— 本项目默认用这个",      "0"),
-    ("sniffer",    "Sniffer",        "纯被动监听（数据出口）—— 本项目默认", "20"),
-    ("tdoa2",      "TDoA Anchor V2", "锚点，最多 8 个；TDoA3 异常时兜底",   "0"),
-    ("twr-anchor", "TWR Anchor",     "双向测距锚点",                        "0"),
-    ("twr-tag",    "TWR Tag",        "官方 TWR 标签（一次只能一个，只输出距离）", "20"),
+# key, display name, note (en), note (cn), default id
+MODE_TABLE = [
+    ("sniffer",    "Sniffer",        "passive listener / data output", "纯被动监听 / 数据出口", "20"),
+    ("tdoa3",      "TDoA Anchor V3", "anchor, unlimited count, multi-room", "锚点，数量不限、可跨房间", "0"),
+    ("tdoa2",      "TDoA Anchor V2", "anchor, max 8, fallback for TDoA3", "锚点，最多 8 个，TDoA3 的兜底", "0"),
+    ("twr-anchor", "TWR Anchor",     "two-way-ranging anchor", "双向测距锚点", "0"),
+    ("twr-tag",    "TWR Tag",        "official TWR tag (one at a time, ranges only)", "官方 TWR 标签（一次一个，只输出距离）", "20"),
 ]
+# shortcut menu: 0 = tag/data output, 1 = anchor
+SHORTCUT = {"0": "sniffer", "1": "tdoa3"}
 
 
 def mode_note(mode):
-    for k, _n, note, _i in MODE_MENU:
-        if k == mode:
-            return note
+    i = 2 if LANG["code"] == "en" else 3
+    for row in MODE_TABLE:
+        if row[0] == mode:
+            return row[i]
     return ""
 
 
-def default_id_for(mode):
-    for k, _n, _note, dflt in MODE_MENU:
-        if k == mode:
-            return dflt
+def mode_default_id(mode):
+    for row in MODE_TABLE:
+        if row[0] == mode:
+            return row[4]
     return "0"
 
 
-def label_for(mode):
-    return {
-        "tdoa3": "基站 / 锚点",
-        "tdoa2": "基站 / 锚点(TDoA2)",
-        "sniffer": "数据出口(纯监听)",
-        "twr-anchor": "TWR 锚点",
-        "twr-tag": "TWR 标签",
-    }.get(mode, mode)
+# ---------------------------------------------------------------------------
+# Localisation (English is the default language)
+# ---------------------------------------------------------------------------
+LANG = {"code": "en"}
+
+S = {
+    "en": {
+        "title": "LPS node console",
+        "tagline": "%s — flash / configure / inspect Bitcraze LPS Nodes",
+        "status": "Status",
+        "com_scan": "COM scan      :",
+        "com_found": "run-mode node(s): %s",
+        "com_none": "no run-mode node",
+        "com_hint1": "A node only gets a COM port while it runs the application (not in DFU mode).",
+        "com_hint2": "If it is in run mode but you cannot connect, fix the serial driver per node",
+        "com_hint3": "(see docs/操作流程.md — Windows driver section).",
+        "fw_ok": "%-8s firmware OK: %d modes incl. TDoA3   current: %s / ID %s   [no flashing needed]",
+        "fw_old2": "%-8s firmware old: TDoA2 only   current: %s / ID %s   [flash to get TDoA3]",
+        "fw_old1": "%-8s firmware very old   [flashing required]",
+        "fw_unknown": "%-8s firmware unknown (probe failed)",
+        "dfu": "DFU device    :",
+        "dfu_none": "none",
+        "dfu_ready": "0483:df11  bState=%d (%s)  -> flashable",
+        "dfu_stuck": "0483:df11  bState=%d (%s)  -> needs recovery",
+        "menu0": "[0] Language: %s   (press 0 to switch EN/CN)",
+        "menu1": "[1] Flash firmware (est. 10 min+)",
+        "menu2": "[2] Configure only (no flashing)",
+        "menu3": "[3] Show current node configuration",
+        "menu4": "[4] COM scan / diagnostics",
+        "menu5": "[5] Recover an interrupted DFU device",
+        "menuq": "[q] Quit",
+        "select": "Select",
+        "bye": "Bye.",
+        "enter_to_menu": "Press Enter to return to the main menu ...",
+        "enter_to_continue": "Press Enter to continue ...",
+        "invalid": "Invalid choice: %s",
+        "mode_prompt": "Target mode:",
+        "mode_shortcut": "[0] Tag / data output (Sniffer)      [1] Anchor / base (TDoA Anchor V3)      [2] More official modes",
+        "mode_choose": "Select mode",
+        "mode_more": "All modes supported by the official firmware:",
+        "mode_unsupported": "[not supported by current firmware]",
+        "id_prompt": "Node ID (0-255)",
+        "id_bad": "ID must be an integer 0-255",
+        "no_dfu": "No DFU device detected.",
+        "no_dfu_manual": "Put the board in DFU mode: unplug USB → hold BM & DFU → plug in → release.",
+        "send_u": "Send 'u' to %s to enter DFU mode? (y/n)",
+        "dfu_stuck_msg": "The DFU device is stuck in bState=%d (%s) — left over from an interrupted flash. Use option [5].",
+        "flash_intro": "Flashing — what happens next:",
+        "flash_intro1": "- takes about 10 minutes (official timing: the stable choice)",
+        "flash_intro2": "- do NOT unplug USB, do NOT press RESET, do NOT open the official GUI",
+        "flash_intro3": "- progress is shown with elapsed / remaining time",
+        "flash_intro4": "- an interrupted flash cannot brick the node (DFU bootloader is in ROM)",
+        "fw_already_ok": "This node's firmware is already usable (supports TDoA3).",
+        "fw_already_ok2": "Option [2] can change its role in seconds without re-flashing.",
+        "flash_anyway": "Flash anyway? (y/N)",
+        "start_flash": "Type y then Enter to start flashing (anything else cancels):",
+        "flashing": "Flashing",
+        "flash_failed": "Flashing failed or was interrupted — the node is not bricked.",
+        "flash_recover": "Recover: unplug USB → hold BM & DFU → plug in → release, then try again.",
+        "wait_port": "Waiting for the node to reboot and expose a serial port ...",
+        "port_found": "serial port = %s",
+        "port_missing": "No new serial port appeared.",
+        "port_missing_hint": "Press the RESET button (or replug USB), then use option [2] or [4].",
+        "cfg_now": "Current configuration read from the node:",
+        "writing": "Writing configuration ...",
+        "cfg_written": "Written: ID %d, mode %s",
+        "do_reset": "Apply it: press the RESET button on the node, or replug USB.",
+        "after_reset": "Press Enter after the reset ...",
+        "verify": "Verifying ...",
+        "done": "Configuration complete",
+        "done_port": "serial port",
+        "done_id": "node ID",
+        "done_mode": "mode",
+        "done_radio": "bitrate / preamble",
+        "done_selftest": "boot self-test",
+        "selftest_ok": "%d x [OK]",
+        "selftest_bad": "%d x [ERROR]",
+        "mismatch": "read back %s, expected %s (press RESET or replug, then check again)",
+        "no_node": "No run-mode node found.",
+        "no_node_hint": "A node in DFU mode has no COM port. Unplug it and plug it back in without pressing any button.",
+        "driver_trouble": "A 0483:5740 device is on USB but Windows created no COM port.",
+        "driver_how": "Device Manager → libusb-win32 devices → 'Crazyflie 2.x (Interface 0)' → Update driver →",
+        "driver_how2": "Browse my computer → Let me pick from a list → 'USB Serial Device' → replug.",
+        "driver_note": "Do this per node; do not remove the Crazyradio driver.",
+        "diag_title": "COM scan / diagnostics",
+        "diag_ports": "COM ports (all): %s",
+        "diag_nodes": "LPS nodes (VID 0483 PID 5740): %d",
+        "diag_usb": "USB 0483:5740 devices: %d",
+        "diag_dfu": "DFU device: %s",
+        "diag_driver_ok": "Serial driver looks fine.",
+        "recover_title": "Recover an interrupted DFU device",
+        "recover_none": "No DFU device present.",
+        "recover_ok": "DFU state is normal (bState=%d) — nothing to recover.",
+        "recover_do": "Recovery (the only reliable action):",
+        "recover_do2": "unplug USB → hold BM & DFU → plug in → release",
+        "press0": "0",
+    },
+    "cn": {
+        "title": "LPS 节点控制台",
+        "tagline": "%s — 刷写 / 配置 / 查看 Bitcraze LPS Node",
+        "status": "当前状态",
+        "com_scan": "COM 扫描结果  :",
+        "com_found": "运行模式节点：%s",
+        "com_none": "未检测到运行模式节点",
+        "com_hint1": "节点只有在运行模式才会出现 COM 口（DFU 模式下不会）。",
+        "com_hint2": "若处于运行模式但连不上，请按文档为每个 LPS Node 修改串口驱动",
+        "com_hint3": "（见 docs/操作流程.md 的 Windows 驱动章节）。",
+        "fw_ok": "%-8s 固件 OK：%d 种模式（含 TDoA3）  当前: %s / ID %s  [无需刷固件]",
+        "fw_old2": "%-8s 固件偏旧：只有 TDoA2  当前: %s / ID %s  [要 TDoA3 需刷固件]",
+        "fw_old1": "%-8s 固件过旧  [必须刷固件]",
+        "fw_unknown": "%-8s 固件未知（探测失败）",
+        "dfu": "DFU 设备    :",
+        "dfu_none": "无",
+        "dfu_ready": "0483:df11  bState=%d (%s)  -> 可刷写",
+        "dfu_stuck": "0483:df11  bState=%d (%s)  -> 需要恢复",
+        "menu0": "[0] 语言：%s   （按 0 切换 中文/EN）",
+        "menu1": "[1] 刷固件（预计 10 分钟以上）",
+        "menu2": "[2] 改配置（不刷固件）",
+        "menu3": "[3] 查看当前节点配置",
+        "menu4": "[4] COM 扫描 / 诊断",
+        "menu5": "[5] 恢复意外中断的 DFU 设备",
+        "menuq": "[q] 退出",
+        "select": "请选择操作",
+        "bye": "已退出。",
+        "enter_to_menu": "按回车返回主界面 ...",
+        "enter_to_continue": "按回车继续 ...",
+        "invalid": "无效选择：%s",
+        "mode_prompt": "请选择节点配置模式：",
+        "mode_shortcut": "[0] 标签 / 数据出口 (Sniffer)      [1] 基站 / 锚点 (TDoA Anchor V3)      [2] 更多官方模式",
+        "mode_choose": "选择模式",
+        "mode_more": "官方固件支持的全部模式：",
+        "mode_unsupported": "[当前固件不支持]",
+        "id_prompt": "节点序号 ID (0-255)",
+        "id_bad": "ID 必须是 0-255 的整数",
+        "no_dfu": "没有检测到 DFU 设备。",
+        "no_dfu_manual": "让板子进入 DFU 模式：拔掉 USB → 按住 BM & DFU 键 → 插 USB → 松手。",
+        "send_u": "是否让脚本通过串口把 %s 送进 DFU？(y/n)",
+        "dfu_stuck_msg": "DFU 设备卡在 bState=%d (%s)——上次刷写中断的残留状态，请用菜单 [5]。",
+        "flash_intro": "刷写说明（接下来会发生什么）：",
+        "flash_intro1": "- 约需 10 分钟（官方原速，最稳的选择）",
+        "flash_intro2": "- 期间不要拔 USB、不要按 RESET、不要打开官方 GUI",
+        "flash_intro3": "- 进度条会显示已用时间与预计剩余时间",
+        "flash_intro4": "- 中途失败不会变砖（DFU 引导在芯片 ROM 里）",
+        "fw_already_ok": "该节点固件已经可用（支持 TDoA3）。",
+        "fw_already_ok2": "用菜单 [2] 改配置只需几秒钟，不必重新刷。",
+        "flash_anyway": "仍然要刷固件吗？(y/N)",
+        "start_flash": "输入 y 再回车才会开始刷写（其它输入取消）：",
+        "flashing": "刷写中",
+        "flash_failed": "刷写失败或被中断 —— 节点不会变砖。",
+        "flash_recover": "恢复：拔掉 USB → 按住 BM & DFU 键 → 插 USB → 松手，然后重试。",
+        "wait_port": "等待节点重启并出现串口 ...",
+        "port_found": "串口 = %s",
+        "port_missing": "没有等到新的串口。",
+        "port_missing_hint": "按一下 RESET 键（或拔插 USB），然后用菜单 [2] 或 [4]。",
+        "cfg_now": "当前从节点读到的配置：",
+        "writing": "正在写入配置 ...",
+        "cfg_written": "已写入：编号 %d，模式 %s",
+        "do_reset": "让配置生效：按一下节点上的 RESET 键，或拔插 USB。",
+        "after_reset": "复位完成后按回车 ...",
+        "verify": "正在校验 ...",
+        "done": "配置完成",
+        "done_port": "串口",
+        "done_id": "编号 ID",
+        "done_mode": "模式",
+        "done_radio": "比特率 / 前导码",
+        "done_selftest": "开机自检",
+        "selftest_ok": "%d 个 [OK]",
+        "selftest_bad": "%d 个 [ERROR]",
+        "mismatch": "读回 %s，期望 %s（按 RESET 或拔插 USB 后再看一次）",
+        "no_node": "没有检测到运行模式的节点。",
+        "no_node_hint": "DFU 模式下不会有 COM 口。请拔掉 USB，不按任何键重新插上。",
+        "driver_trouble": "USB 上有 0483:5740 设备，但 Windows 没有创建 COM 口。",
+        "driver_how": "设备管理器 → libusb-win32 devices → 'Crazyflie 2.x (Interface 0)' → 更新驱动程序 →",
+        "driver_how2": "浏览我的电脑 → 让我从列表中选取 → 'USB 串行设备' → 拔插 USB。",
+        "driver_note": "每个节点各做一次；不要直接卸载 Crazyradio 的驱动。",
+        "diag_title": "COM 扫描 / 诊断",
+        "diag_ports": "系统串口：%s",
+        "diag_nodes": "LPS 节点（VID 0483 PID 5740）：%d",
+        "diag_usb": "USB 上的 0483:5740 设备：%d",
+        "diag_dfu": "DFU 设备：%s",
+        "diag_driver_ok": "串口驱动看起来正常。",
+        "recover_title": "恢复意外中断的 DFU 设备",
+        "recover_none": "当前没有 DFU 设备。",
+        "recover_ok": "DFU 状态正常（bState=%d），无需恢复。",
+        "recover_do": "恢复动作（唯一可靠）：",
+        "recover_do2": "拔掉 USB → 按住 BM & DFU 键 → 插 USB → 松手",
+        "press0": "0",
+    },
+}
 
 
-def ask_mode(default="tdoa3", supported=None):
-    """让用户选择要配置的模式 —— 覆盖官方固件支持的全部模式。
-
-    supported: 已探测到的固件支持的模式名列表；为 None 表示未知（不标注）。
-    """
-    print("  可选模式（官方固件支持的全部模式）：")
-    for i, (key, name, note, _dflt) in enumerate(MODE_MENU):
-        marks = ""
-        if key == default:
-            marks += "   ← 默认"
-        if supported is not None and name not in supported:
-            marks += "   [当前固件不支持]"
-        print("    [%d] %-16s %s%s" % (i + 1, name, note, marks))
-    idx = [i for i, (k, _n, _x, _d) in enumerate(MODE_MENU) if k == default]
-    dflt = str((idx[0] + 1) if idx else 1)
-    sel = ask("选择模式", dflt)
-    try:
-        return MODE_MENU[int(sel) - 1][0]
-    except Exception:
-        warn("选择无效，使用默认模式 %s" % MODE_NAME[default])
-        return default
-
-WARN_FLASHING = (
-    "  ⚠ 刷写期间：不要拔 USB、不要按 Reset、不要打开官方 GUI（它会抢设备）\n"
-    "  ⚠ 中途失败不会变砖：按住 DFU 键重新上电即可重来\n"
-)
+def t(key, *args):
+    s = S[LANG["code"]].get(key, key)
+    return s % args if args else s
 
 
 # ---------------------------------------------------------------------------
-# 输出小工具
+# Small console helpers
 # ---------------------------------------------------------------------------
 def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def hr(title=""):
-    print("=" * 66)
-    if title:
-        print("  " + title)
-        print("=" * 66)
+def hr(ch="="):
+    print(ch * 66)
 
 
 def ok(m):
@@ -139,11 +298,11 @@ def info(m):
 
 
 def warn(m):
-    print("  [警告] " + m)
+    print("  [!!]   " + m)
 
 
 def err(m):
-    print("  [失败] " + m)
+    print("  [ERR]  " + m)
 
 
 def ask(prompt, default=""):
@@ -151,24 +310,43 @@ def ask(prompt, default=""):
     return s if s else default
 
 
-def pause(msg="按回车返回菜单 ..."):
+def confirm(prompt, default_no=True):
+    """显式确认：只接受 y/yes（或明确指定默认 yes 时的空回车）。"""
     try:
-        input("\n  " + msg)
-    except KeyboardInterrupt:
-        raise
+        s = input("  %s " % prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if s in ("y", "yes"):
+        return True
+    if s == "" and not default_no:
+        return True
+    return False
+
+
+def pause():
+    try:
+        input("\n  " + t("enter_to_menu"))
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def pause_continue():
+    try:
+        input("  " + t("enter_to_continue"))
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 # ---------------------------------------------------------------------------
-# 状态扫描（状态机的"感知"部分）
+# Scan / probe
 # ---------------------------------------------------------------------------
 def scan():
-    """扫描当前硬件状态，返回 dict"""
-    snap = {
-        "nodes": [],         # 正常运行模式的 LPS Node（含固件能力探测结果）
-        "dfu": None,         # bState 或 None
-        "usb_nodes": 0,      # USB 上能看到的 0483:5740 数量
-        "driver_trouble": False,
-    }
+    snap = {"nodes": [], "dfu": None, "usb_nodes": 0, "driver_trouble": False,
+            "all_ports": []}
+    try:
+        snap["all_ports"] = [p.device for p in F.list_ports_safe()]
+    except Exception:
+        pass
     try:
         for p in F.find_node_ports():
             fw = None
@@ -180,7 +358,7 @@ def scan():
     except Exception:
         pass
     try:
-        d, st = F.open_dfu(DFUSE)
+        d, st = F.open_dfu(F.load_dfuse()[1])
         if d is not None:
             snap["dfu"] = st
             F.release_dfu(d)
@@ -196,475 +374,355 @@ def scan():
     return snap
 
 
-def fw_text(fw):
-    """把探测结果压成一行短描述"""
-    if not fw:
-        return "固件能力未知"
-    node_id = fw.get("address", fw.get("id", "?"))
-    if fw.get("has_tdoa3"):
-        extra = " 当前: %s / ID %s" % (fw.get("mode", "?"), node_id)
-        return "固件 OK（支持 TDoA3，%d 种模式）%s" % (len(fw.get("modes", [])), extra)
-    if fw.get("has_tdoa2"):
-        return "固件偏旧（只有 TDoA2，无 TDoA3，当前 ID %s）→ 需要刷固件" % node_id
-    return "固件过旧（连 TDoA2 都没有）→ 需要刷固件"
+def dfu_state_name(state):
+    return F.DFU_STUCK_STATES.get(state, "DFU_ERROR" if state == 10 else "?")
 
 
 def render(snap, message=None):
-    print()
-    hr("LPS Node 配置向导")
-    print("  当前状态：")
+    clear()
+    hr()
+    print("  " + t("title"))
+    print("  " + t("tagline", PROJECT))
+    hr()
+    print("  " + t("status"))
+    # --- COM scan result (the primary thing the user needs to see) ---
     if snap["nodes"]:
-        for n in snap["nodes"]:
-            print("    ● 串口节点 : %-8s %s" % (n["device"], n["desc"]))
-            print("                  %s" % fw_text(n["fw"]))
+        print("    " + t("com_found", ", ".join(n["device"] for n in snap["nodes"])))
     else:
-        print("    ○ 串口节点 : 无（节点要处于运行模式才会出现 COM 口）")
-    if snap["dfu"] is None:
-        print("    ○ DFU 设备 : 无")
-    else:
-        state_name = F.DFU_STUCK_STATES.get(snap["dfu"], "DFU_ERROR" if snap["dfu"] == 10 else "?")
-        mark = "可刷写" if snap["dfu"] in (2, 10) else "需恢复"
-        print("    ● DFU 设备 : 0483:df11  bState=%d (%s) → %s"
-              % (snap["dfu"], state_name, mark))
+        print("    " + t("com_scan") + " " + t("com_none"))
+        print("           " + t("com_hint1"))
+        print("           " + t("com_hint2"))
+        print("           " + t("com_hint3"))
+    # --- firmware capability per node ---
+    for n in snap["nodes"]:
+        fw = n["fw"]
+        if not fw:
+            print("    %-12s %s" % (n["device"], t("fw_unknown")))
+            continue
+        nid = fw.get("address", fw.get("id", "?"))
+        if fw.get("has_tdoa3"):
+            print("    " + t("fw_ok", n["device"], len(fw.get("modes", [])),
+                             fw.get("mode", "?"), nid))
+        elif fw.get("has_tdoa2"):
+            print("    " + t("fw_old2", n["device"], fw.get("mode", "?"), nid))
+        else:
+            print("    " + t("fw_old1", n["device"]))
     if snap["driver_trouble"]:
-        print("    ⚠ 检测到 %d 个 USB 节点但没有串口 → 驱动被 libusb/Zadig 抢占"
-              % snap["usb_nodes"])
+        print()
+        warn(t("driver_trouble"))
+        print("           " + t("driver_how"))
+        print("           " + t("driver_how2"))
+        print("           " + t("driver_note"))
+    # --- DFU ---
+    if snap["dfu"] is None:
+        print("    " + t("dfu") + " " + t("dfu_none"))
+    elif snap["dfu"] in (2, 10):
+        print("    " + t("dfu") + " " + t("dfu_ready", snap["dfu"], dfu_state_name(snap["dfu"])))
+    else:
+        print("    " + t("dfu") + " " + t("dfu_stuck", snap["dfu"], dfu_state_name(snap["dfu"])))
     if message:
         print()
         for line in str(message).splitlines():
             print("  " + line)
     print()
     hr()
-    print("  [1] 刷固件 + 配置为【基站】      (TDoA Anchor V3)   ← 本项目常用")
-    print("  [2] 刷固件 + 配置为【数据出口】  (Sniffer)          ← 本项目常用")
-    print("  [3] 刷固件 + 配置为【其它模式】  (TWR / TDoA2 等全部官方模式)")
-    print("  [4] 只配置（不刷固件）           ← 固件已 OK 时用这个，几秒钟完成")
-    print("  [5] 查看节点当前配置")
-    print("  [6] 重新扫描 / 诊断")
-    print("  [7] 恢复卡住的 DFU 设备")
-    print("  [q] 退出")
+    print("  " + t("menu0", "EN" if LANG["code"] == "en" else "中文"))
+    print("  " + t("menu1"))
+    print("  " + t("menu2"))
+    print("  " + t("menu3"))
+    print("  " + t("menu4"))
+    print("  " + t("menu5"))
+    print("  " + t("menuq"))
     hr()
 
 
 # ---------------------------------------------------------------------------
-# 串口读写（配置阶段）
+# Mode / ID prompts
 # ---------------------------------------------------------------------------
-def read_config(port, seconds=1.8):
-    import serial
-    try:
-        ser = serial.Serial(port, 115200, timeout=0.2)
-    except Exception as e:
-        err("打不开串口 %s：%s" % (port, e))
-        print("       官方 GUI（python -m lpstools）可能正占用它，关掉再试。")
-        return None
-    try:
-        end = time.time() + seconds
-        buf = b""
-        while time.time() < end:
-            chunk = ser.read(4096)
-            if chunk:
-                buf += chunk
-    finally:
-        ser.close()
-    return buf.decode("utf-8", "replace")
+def ask_mode(supported=None):
+    print()
+    print("  " + t("mode_prompt"))
+    print("    " + t("mode_shortcut"))
+    sel = ask(t("mode_choose"), "1")
+    if sel in SHORTCUT:
+        return SHORTCUT[sel]
+    if sel == "2":
+        print()
+        print("  " + t("mode_more"))
+        for i, row in enumerate(MODE_TABLE):
+            key, name = row[0], row[1]
+            mark = ""
+            if supported is not None and name not in supported:
+                mark = "   " + t("mode_unsupported")
+            print("    [%d] %-16s %s%s" % (i + 1, name, mode_note(key), mark))
+        sel2 = ask(t("mode_choose"), "2")
+        try:
+            return MODE_TABLE[int(sel2) - 1][0]
+        except Exception:
+            warn(t("invalid", sel2))
+            return "tdoa3"
+    warn(t("invalid", sel))
+    return "tdoa3"
 
 
-def parse_banner(text):
-    import re
-    cfg = {}
-    m = re.search(r"Address is 0x([0-9A-Fa-f]+)", text)
-    if m:
-        cfg["id"] = int(m.group(1), 16)
-    m = re.search(r"Mode is (.+)", text)
-    if m:
-        cfg["mode"] = m.group(1).strip()
-    m = re.search(r"Bitrate: (\w+)", text)
-    if m:
-        cfg["bitrate"] = m.group(1)
-    m = re.search(r"Preamble: (\w+)", text)
-    if m:
-        cfg["preamble"] = m.group(1)
-    cfg["ok_count"] = text.count("[OK]")
-    cfg["bad_count"] = text.count("[FAIL]") + text.count("[ERROR]")
-    return cfg
+def ask_id(mode):
+    dflt = mode_default_id(mode)
+    while True:
+        s = ask(t("id_prompt"), dflt)
+        try:
+            v = int(s)
+            if 0 <= v <= 255:
+                return v
+        except Exception:
+            pass
+        warn(t("id_bad"))
 
 
-def write_config(port, node_id, mode, radio=None):
-    import serial
-    try:
-        ser = serial.Serial(port, 115200, timeout=0.2)
-    except Exception as e:
-        err("打不开串口 %s：%s" % (port, e))
-        return False
-    try:
-        end = time.time() + 1.2
-        while time.time() < end:
-            ser.read(4096)
-        keys = ([str(node_id).encode()] if node_id < 10
-                else [b"i", str(node_id).encode(), b"\n"])
-        keys += MODE_KEYS[mode]
-        if radio is not None:
-            keys += [b"r", str(radio).encode()]
-        for k in keys:
-            ser.write(k)
-            ser.flush()
-            time.sleep(0.12)
-        time.sleep(0.4)
-    finally:
-        ser.close()
-    return True
+# ---------------------------------------------------------------------------
+# Flashing + configuration
+# ---------------------------------------------------------------------------
+def ensure_dfu(snap):
+    """确保有可用的 DFU 设备；返回 True/False"""
+    if snap["dfu"] is not None:
+        if snap["dfu"] not in (2, 10):
+            warn(t("dfu_stuck_msg", snap["dfu"], dfu_state_name(snap["dfu"])))
+            return False
+        return True
 
-
-def wait_port(port, timeout=20.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if any(p.device.upper() == port.upper() for p in F.list_ports_safe()):
-            return True
-        time.sleep(0.5)
+    if len(snap["nodes"]) == 1:
+        ans = ask(t("send_u", snap["nodes"][0]["device"]), "y")
+        if ans.lower().startswith("y"):
+            info("u -> %s" % snap["nodes"][0]["device"])
+            F.enter_dfu(snap["nodes"][0]["device"], quiet=True)
+            time.sleep(1.0)
+            s2 = scan()
+            if s2["dfu"] is not None:
+                return True
+    warn(t("no_dfu"))
+    print("        " + t("no_dfu_manual"))
     return False
 
 
-def wait_new_port(before, timeout=25.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        now = {p.device for p in F.find_node_ports()}
-        new = sorted(now - before)
-        if len(new) == 1:
-            return new[0]
-        if len(new) > 1:
-            warn("出现了多个新节点，取第一个 %s（建议只插一块）" % new[0])
-            return new[0]
-        time.sleep(0.5)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 动作：刷固件
-# ---------------------------------------------------------------------------
-def do_flash(fw_path):
-    """刷写；返回 True 表示成功（设备已在重启中）"""
-    if not fw_path.exists():
-        err("固件不存在：%s" % fw_path)
-        print("       请把 .dfu 固件放到 firmware\\ 目录（项目默认提供 2022.09 版本）")
-        print("       或运行 bootstrap.ps1 自动下载。")
-        return False
-
-    d, state = F.open_dfu(DFUSE)
-    if d is None:
-        err("没有检测到 DFU 设备（0483:df11）")
-        print("       让板子进刷机模式：拔掉 USB → 按住 DFU 键(6) → 插 USB → 松手")
-        return False
-    F.release_dfu(d)
-
-    ready, msg = F.ensure_dfu_idle(DFUSE, recover=False)
-    if not ready:
-        err(msg)
-        return False
-    ok(msg)
-
+def flash_fw():
     print()
-    print(WARN_FLASHING)
-    input("  准备就绪，按回车开始刷写（约 11 分钟）...")
-    print()
+    info(t("flash_intro"))
+    print("      " + t("flash_intro1"))
+    print("      " + t("flash_intro2"))
+    print("      " + t("flash_intro3"))
+    print("      " + t("flash_intro4"))
+    if not DEFAULT_FW.exists():
+        err("firmware not found: %s" % DEFAULT_FW)
+        print("        Put the .dfu file into: %s" % FW_DIR)
+        return False
+    if not confirm(t("start_flash"), default_no=True):
+        info("Cancelled - nothing was written.")
+        return False
     try:
-        F.flash_file(DFU_CLS, fw_path)
+        F.flash_file(F.load_dfuse()[0], DEFAULT_FW)
     except SystemExit:
-        err("刷写中断或失败 —— 不会变砖")
-        print("       恢复：拔掉 USB → 按住 DFU 键(6) → 插 USB → 松手 → 回菜单重试")
+        err(t("flash_failed"))
+        print("        " + t("flash_recover"))
         return False
     except Exception as e:
-        err("刷写异常：%s: %s" % (type(e).__name__, e))
-        print("       恢复：拔掉 USB → 按住 DFU 键(6) → 插 USB → 松手 → 回菜单重试")
+        err("%s: %s" % (type(e).__name__, e))
+        print("        " + t("flash_recover"))
         return False
     return True
 
 
-# ---------------------------------------------------------------------------
-# 动作：配置（写 ID + 模式）并校验
-# ---------------------------------------------------------------------------
-def do_configure(port, node_id, mode):
-    print()
-    info("配置前状态：")
-    text = read_config(port)
+def show_node_config(port, text=None):
     if text is None:
-        return False
-    before = parse_banner(text)
-    print("       当前编号 = %s，模式 = %s" % (before.get("id", "?"), before.get("mode", "?")))
+        text = C.read_config_text(port) or ""
+    cfg = C.parse_banner(text)
+    print("    %-18s %s" % (t("done_id"), cfg.get("address", "?")))
+    print("    %-18s %s" % (t("done_mode"), cfg.get("mode", "?")))
+    print("    %-18s %s / %s" % (t("done_radio"), cfg.get("bitrate", "?"), cfg.get("preamble", "?")))
+    bad = text.count("[FAIL]") + text.count("[ERROR]")
+    good = text.count("[OK]")
+    print("    %-18s %s" % (t("done_selftest"),
+                            t("selftest_bad", bad) if bad else t("selftest_ok", good)))
+    return cfg
 
-    if not write_config(port, node_id, mode):
-        return False
-    ok("已写入：编号 = %d，模式 = %s" % (node_id, MODE_NAME[mode]))
+
+def write_and_verify(port, node_id, mode):
     print()
-    print("  >> 让配置生效：按一下节点上的 Reset 键（右边靠下那个），或拔插一次 USB")
+    info(t("writing"))
+    if not C.write_config(port, node_id, mode, MODE_KEYS):
+        return False
+    ok(t("cfg_written", node_id, MODE_NAME[mode]))
+    print()
+    print("  >> " + t("do_reset"))
     try:
-        input("     复位完成后按回车校验（Ctrl+C 放弃）...")
-    except KeyboardInterrupt:
-        raise
-
-    if not wait_port(port, 20.0):
-        err("串口 %s 没有再出现（可能换了 COM 号或没插好）" % port)
-        print("       回菜单选 [5] 重新扫描查看。")
+        input("     " + t("after_reset"))
+    except (EOFError, KeyboardInterrupt):
+        pass
+    info(t("verify"))
+    if not C.wait_port(port, 20.0):
+        text = C.read_config_text(port) or ""
+        if not text:
+            warn(t("port_missing"))
+            print("        " + t("port_missing_hint"))
+            return False
+    text = C.read_config_text(port) or ""
+    cfg = C.parse_banner(text)
+    hr()
+    print("  " + t("done"))
+    print("    %-18s %s" % (t("done_port"), port))
+    show_node_config(port, text)
+    if cfg.get("address") != node_id:
+        warn(t("mismatch", cfg.get("address"), node_id))
         return False
-    text = read_config(port)
-    cfg = parse_banner(text or "")
-    print()
-    good = True
-    if cfg.get("id") == node_id:
-        ok("编号 = %d" % node_id)
-    else:
-        warn("读回编号 = %s，期望 %d（再按一次 Reset 或拔插 USB 后重看）"
-             % (cfg.get("id"), node_id))
-        good = False
-    if cfg.get("mode") == MODE_NAME[mode]:
-        ok("模式 = %s" % MODE_NAME[mode])
-    else:
-        warn("读回模式 = %s，期望 %s" % (cfg.get("mode"), MODE_NAME[mode]))
-        good = False
-    if cfg.get("bad_count"):
-        warn("开机自检有 %d 项失败，检查 USB 线/供电" % cfg["bad_count"])
-        good = False
-    else:
-        ok("开机自检通过（%d 个 [OK]）" % cfg.get("ok_count", 0))
-    info("比特率 %s / 前导码 %s" % (cfg.get("bitrate", "?"), cfg.get("preamble", "?")))
-    return good
+    if cfg.get("mode") != MODE_NAME[mode]:
+        warn(t("mismatch", cfg.get("mode"), MODE_NAME[mode]))
+        return False
+    return True
 
 
-# ---------------------------------------------------------------------------
-# 动作：一键（刷 + 配）
-# ---------------------------------------------------------------------------
-def action_flash_and_config(preset_mode=None):
-    mode = preset_mode if preset_mode else ask_mode()
-    label = label_for(mode)
-    default_id = default_id_for(mode)
-
-    hr("刷固件 + 配置为【%s】" % label)
-    info("目标模式：%s —— %s" % (MODE_NAME[mode], mode_note(mode)))
-    snap = scan()
-
-    # ① 节点正在运行：先看固件能不能直接用，能就直接配置，无需刷固件
-    if snap["dfu"] is None and snap["nodes"]:
-        target = None
-        if len(snap["nodes"]) == 1:
-            target = snap["nodes"][0]
-        else:
-            for i, n in enumerate(snap["nodes"]):
-                print("    [%d] %s  %s" % (i + 1, n["device"], fw_text(n["fw"])))
-            sel = ask("选择要配置的节点序号", "1")
-            try:
-                target = snap["nodes"][int(sel) - 1]
-            except Exception:
-                err("序号无效")
-                return
-        fw = target["fw"]
-        info("%s → %s" % (target["device"], fw_text(fw)))
+def action_flash(snap):
+    mode = ask_mode()
+    node_id = ask_id(mode)
+    # 固件已经可用时先提醒，避免白等 10 分钟
+    for n in snap["nodes"]:
+        fw = n["fw"]
         if fw and fw.get("has_tdoa3"):
-            ans = ask("该节点固件已支持 TDoA3，【跳过刷固件】直接配置？(y/n)", "y")
-            if ans.lower().startswith("y"):
-                node_id = ask("要设置的编号 ID (0-255)", default_id)
-                try:
-                    node_id = int(node_id)
-                    assert 0 <= node_id <= 255
-                except Exception:
-                    err("编号必须是 0-255 的整数")
-                    return
-                do_configure(target["device"], node_id, mode)
+            print()
+            warn(t("fw_already_ok"))
+            print("        " + t("fw_already_ok2"))
+            if not ask(t("flash_anyway"), "n").lower().startswith("y"):
+                info("OK - use menu [2] to change the configuration instead.")
                 return
-        elif fw is not None:
-            warn("这块节点的固件不支持 TDoA3，需要先刷固件")
-
-    # ② 走刷写流程：需要有 DFU 设备
-    if snap["dfu"] is None:
-        if len(snap["nodes"]) == 1:
-            ans = ask("没有 DFU 设备。是否让脚本通过串口把 %s 送进 DFU？(y/n)"
-                      % snap["nodes"][0]["device"], "y")
-            if ans.lower().startswith("y"):
-                info("向 %s 发送 'u' ..." % snap["nodes"][0]["device"])
-                F.enter_dfu(snap["nodes"][0]["device"], quiet=True)
-                time.sleep(1.0)
-                snap = scan()
-        if snap["dfu"] is None:
-            err("仍未检测到 DFU 设备")
-            print("       请手动进入刷机模式：拔掉 USB → 按住 DFU 键(6) → 插 USB → 松手")
-            print("       然后回菜单重试（菜单选 [5] 可重新扫描）")
-            return
-
-    node_id = ask("要设置的编号 ID (0-255)", default_id)
-    try:
-        node_id = int(node_id)
-        assert 0 <= node_id <= 255
-    except Exception:
-        err("编号必须是 0-255 的整数")
-        return
-
+            break
     before = {p.device for p in F.find_node_ports()}
-    print()
-    if not do_flash(DEFAULT_FW):
+    if not ensure_dfu(snap):
         return
-
-    info("等待节点重启并出现串口 ...")
-    port = wait_new_port(before, 30.0)
-    if port is None:
-        err("没等到新的节点串口")
-        print("       按一下 Reset 键(4) 或拔插 USB，然后回菜单选 [3] 只配置 / [5] 扫描")
+    if not flash_fw():
         return
-    ok("串口 = %s" % port)
-    do_configure(port, node_id, mode)
+    info(t("wait_port"))
+    port = C.wait_new_port(before, 30.0)
+    if not port:
+        warn(t("port_missing"))
+        print("        " + t("port_missing_hint"))
+        return
+    ok(t("port_found", port))
+    write_and_verify(port, node_id, mode)
 
 
-def action_config_only():
-    hr("只配置（不刷固件）")
-    snap = scan()
+def action_config(snap):
     if not snap["nodes"]:
         if snap["driver_trouble"]:
-            err("USB 上有节点但没有 COM 口 —— 驱动被 libusb/Zadig 抢占了")
-            print("       解决：设备管理器 → libusb-win32 devices → 'Crazyflie 2.x (Interface 0)'")
-            print("             → 更新驱动程序 → 从列表选 'USB 串行设备' → 拔插 USB")
+            err(t("driver_trouble"))
+            print("        " + t("driver_how"))
+            print("        " + t("driver_how2"))
+            print("        " + t("driver_note"))
         else:
-            err("没有在线的节点（节点要在运行模式，不在 DFU 模式）")
-            print("       板子刚上电时若停在 DFU，请拔掉 USB 后【不按键】重新插上")
+            err(t("no_node"))
+            print("        " + t("no_node_hint"))
         return
 
     if len(snap["nodes"]) == 1:
-        port = snap["nodes"][0]["device"]
-        info("自动选中串口 %s" % port)
+        target = snap["nodes"][0]
     else:
         for i, n in enumerate(snap["nodes"]):
-            print("    [%d] %s  %s  %s" % (i + 1, n["device"], n["desc"], fw_text(n["fw"])))
-        sel = ask("选择节点序号", "1")
+            print("    [%d] %s  %s" % (i + 1, n["device"], n["desc"]))
+        sel = ask(t("select"), "1")
         try:
-            port = snap["nodes"][int(sel) - 1]["device"]
+            target = snap["nodes"][int(sel) - 1]
         except Exception:
-            err("序号无效")
+            err(t("invalid", sel))
             return
+    port = target["device"]
+    print()
+    info(t("cfg_now"))
+    show_node_config(port)
 
     mode = ask_mode()
-    default_id = default_id_for(mode)
-    node_id = ask("编号 ID (0-255)", default_id)
-    try:
-        node_id = int(node_id)
-        assert 0 <= node_id <= 255
-    except Exception:
-        err("编号必须是 0-255 的整数")
-        return
-    do_configure(port, node_id, mode)
+    node_id = ask_id(mode)
+    write_and_verify(port, node_id, mode)
 
 
-def action_read():
-    hr("查看节点当前配置")
-    ports = F.find_node_ports()
-    if not ports:
-        err("没有在线的节点（DFU 模式下不会出现 COM 口）")
+def action_show(snap):
+    if not snap["nodes"]:
+        err(t("no_node"))
         return
-    for p in ports:
-        text = read_config(p.device)
-        cfg = parse_banner(text or "")
+    for n in snap["nodes"]:
         print()
-        print("  %s" % p.device)
-        print("    编号   : %s" % cfg.get("id", "?"))
-        print("    模式   : %s" % cfg.get("mode", "?"))
-        print("    比特率 : %s    前导码: %s" % (cfg.get("bitrate", "?"), cfg.get("preamble", "?")))
-        print("    自检   : %d 个 [OK]，%d 个异常" % (cfg.get("ok_count", 0), cfg.get("bad_count", 0)))
+        info(n["device"])
+        show_node_config(n["device"])
 
 
-def action_recover():
-    hr("恢复卡住的 DFU 设备")
-    d, state = F.open_dfu(DFUSE)
-    if d is None:
-        info("当前没有 DFU 设备。")
-        if F.find_node_ports():
-            info("节点在运行模式，可以正常配置。")
-        return
-
-    if state in (2, 10):
-        ok("DFU 状态正常（bState=%d），不需要恢复" % state)
-        F.release_dfu(d)
-        return
-    name = F.DFU_STUCK_STATES.get(state, "未知")
-    warn("DFU 卡在 bState=%d (%s)" % (state, name))
-    print("     这是上次刷写被中断留下的残留状态，STM32 会拒绝新命令。")
-    print("     唯一可靠的恢复动作：")
-    print("        拔掉 USB  →  按住 DFU 键(6)  →  插入 USB  →  松手")
-    try:
-        F.release_dfu(d)
-    except Exception:
-        pass
-
-
-def action_diagnose():
-    hr("诊断")
-    snap = scan()
-    print("  串口节点数 : %d" % len(snap["ports"]))
-    print("  USB 节点数 : %d" % snap["usb_nodes"])
-    print("  DFU 状态   : %s" % (snap["dfu"] if snap["dfu"] is not None else "无"))
+def action_diag(snap):
+    print("  " + t("diag_title"))
+    print("    " + t("diag_ports", ", ".join(snap["all_ports"]) or "-"))
+    print("    " + t("diag_nodes", len(snap["nodes"])))
+    print("    " + t("diag_usb", snap["usb_nodes"]))
+    print("    " + t("diag_dfu", snap["dfu"] if snap["dfu"] is not None else t("dfu_none")))
     if snap["driver_trouble"]:
         print()
-        warn("USB 上有节点但没有 COM 口（典型 Zadig/libusb 抢占）")
-        print("     确认当前哪些设备被占用：")
-        print("       powershell -ExecutionPolicy Bypass -File .\\tools\\fix_serial_driver.ps1")
-        print("     修复方式见上面输出（推荐逐个节点在设备管理器里改，不要删 radio 驱动）")
-    else:
-        ok("驱动看起来正常")
+        warn(t("driver_trouble"))
+        print("      " + t("driver_how"))
+        print("      " + t("driver_how2"))
+        print("      " + t("driver_note"))
+    elif snap["nodes"]:
+        ok(t("diag_driver_ok"))
+
+
+def action_recover(snap):
+    print("  " + t("recover_title"))
+    if snap["dfu"] is None:
+        info(t("recover_none"))
+        return
+    if snap["dfu"] in (2, 10):
+        ok(t("recover_ok", snap["dfu"]))
+        return
+    warn(t("dfu_stuck_msg", snap["dfu"], dfu_state_name(snap["dfu"])))
     print()
-    info("提示：哪块板子要改驱动，就只插哪一块，避免一次影响多台设备。")
+    print("    " + t("recover_do"))
+    print("       " + t("recover_do2"))
 
 
 # ---------------------------------------------------------------------------
-# 主循环（状态机）
+# Main loop
 # ---------------------------------------------------------------------------
 def main():
-    hr("LPS Node 配置向导")
-    print("  上电后在这里完成：自动识别 COM → 刷固件 / 配置节点，循环可用。")
-    print("  固件目录：firmware\\   默认：%s" % DEFAULT_FW.name)
-    print("  刷写稳定性优先：默认官方原速，约 11 分钟/块。")
-    if not DEFAULT_FW.exists():
-        warn("默认固件不存在：%s（请放入 firmware\\ 或运行 bootstrap.ps1）" % DEFAULT_FW)
-
-    last_msg = ""
+    message = ""
     while True:
+        snap = scan()
+        render(snap, message)
+        message = ""
         try:
-            snap = scan()
-            clear()
-            render(snap, last_msg)
-            last_msg = ""
-            choice = input("  请选择操作: ").strip().lower()
-        except KeyboardInterrupt:
-            print("\n  已退出。")
+            choice = input("  " + t("select") + ": ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  " + t("bye"))
             return
 
         try:
-            if choice == "1":
-                action_flash_and_config("tdoa3")
-                last_msg = "上一步：刷固件并配置为【基站】"
+            if choice == "0":
+                LANG["code"] = "cn" if LANG["code"] == "en" else "en"
+                continue
+            elif choice == "1":
+                action_flash(snap)
             elif choice == "2":
-                action_flash_and_config("sniffer")
-                last_msg = "上一步：刷固件并配置为【数据出口】"
+                action_config(snap)
             elif choice == "3":
-                action_flash_and_config(None)
-                last_msg = "上一步：刷固件并配置为【自选模式】"
+                action_show(snap)
             elif choice == "4":
-                action_config_only()
-                last_msg = "上一步：只配置"
+                action_diag(snap)
             elif choice == "5":
-                action_read()
-                last_msg = "上一步：查看配置"
-            elif choice == "6":
-                action_diagnose()
-                last_msg = "上一步：诊断"
-            elif choice == "7":
-                action_recover()
-                last_msg = "上一步：DFU 恢复"
+                action_recover(snap)
             elif choice in ("q", "quit", "exit"):
-                print("\n  已退出。")
+                print("\n  " + t("bye"))
                 return
             else:
-                last_msg = "无效选择：%s" % choice
+                message = t("invalid", choice)
                 continue
             pause()
-        except KeyboardInterrupt:
-            print("\n  已中断当前操作，返回菜单。")
-            continue
+        except (EOFError, KeyboardInterrupt):
+            print("\n  " + t("bye"))
+            return
+        except BrokenPipeError:
+            os._exit(0)
         except Exception as e:
-            err("操作出错：%s: %s" % (type(e).__name__, e))
+            err("%s: %s" % (type(e).__name__, e))
             pause()
 
 
@@ -672,4 +730,6 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n  已退出。")
+        print("\n" + S[LANG["code"]]["bye"])
+    except BrokenPipeError:
+        os._exit(0)

@@ -274,6 +274,65 @@ def send_keys(ser, keys, gap=0.10):
         time.sleep(gap)
 
 
+def write_config(port, node_id, mode, mode_keys=None, radio=None):
+    """按串口菜单的按键序列写入 ID 与模式（写进 EEPROM，重启后生效）。
+
+    mode_keys 允许外部传入模式按键表（默认用本模块的 MODE_KEYS）。
+    返回 True/False。
+    """
+    keys_map = mode_keys or MODE_KEYS
+    if mode not in keys_map:
+        print("!! 未知模式 %s" % mode)
+        return False
+    try:
+        ser = open_port(port)
+    except SystemExit:
+        return False
+    try:
+        read_banner_until(ser, 2.0)          # 先吃掉开机横幅
+        keys = ([str(node_id).encode()] if node_id < 10
+                else [b"i", str(node_id).encode(), b"\n"])
+        keys += list(keys_map[mode])
+        if radio is not None:
+            keys += [b"r", str(radio).encode()]
+        send_keys(ser, keys)
+        time.sleep(0.4)
+    finally:
+        ser.close()
+    return True
+
+
+def wait_port(port, timeout=20.0):
+    """等待某个串口重新出现（复位/拔插后）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if any(p.device.upper() == port.upper() for p in list_nodes()):
+            return True
+        if any(p.device.upper() == port.upper() for p in list_ports_all()):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def list_ports_all():
+    from serial.tools import list_ports
+    return list(list_ports.comports())
+
+
+def wait_new_port(before, timeout=25.0):
+    """等待出现一个新的 LPS Node 串口（刷完固件后用它认出新板子）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = {p.device for p in list_nodes()}
+        new = sorted(now - set(before))
+        if len(new) == 1:
+            return new[0]
+        if len(new) > 1:
+            return new[0]
+        time.sleep(0.5)
+    return None
+
+
 def configure(port, node_id=None, mode=None, radio=None, power=None, reset=False,
               quiet=False):
     ser = open_port(port)
