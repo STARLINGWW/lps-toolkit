@@ -112,6 +112,7 @@ per line; bridge them to MAVLink `VISION_POSITION_ESTIMATE` (PX4: enable
 | Symptom | Fix |
 |---|---|
 | Capture gets no frames | node really in Sniffer mode? anchors powered? same bitrate/preamble on all nodes? |
+| Capture shows `0 帧` while the file keeps growing | the node was still printing the **text** format (usually because the console was parked in a sub-menu and the `b` key was swallowed). Current versions reset the console before switching and parse **both** formats, writing a normalised `*.norm.bin` for replay — use that file with `--input` |
 | Fewer than 4 anchors visible | move anchors closer / raise them / check line of sight |
 | No position printed | < 4 measurements; ID mismatch with `anchors.yaml`; `distance` field empty (anchor-to-anchor ranging not established yet) |
 | Position drifts over minutes | clock correction not converging — check `cc` in `--check` |
@@ -216,6 +217,7 @@ python tools\lps_tdoa3_solver.py --port COM20 --anchors tools\anchors_example.ya
 | 现象 | 处理 |
 |---|---|
 | 抓不到包 | 节点是否真是 Sniffer 模式；锚点是否上电；所有节点比特率/前导码是否一致 |
+| 文件在涨但显示 `0 帧` | 节点当时仍在输出**文本格式**（通常是控制台停在某个子菜单，`b` 被吃掉）。新版脚本会先复位控制台再切二进制，并且**两种格式都能解析**，同时写出 `*.norm.bin`——用这个文件传给 `--input` 即可 |
 | 可见锚点少于 4 个 | 拉近/抬高锚点；检查遮挡 |
 | 不出位置 | 测量不足 4 条；`anchors.yaml` 的 ID 与实际不符；`distance` 字段为空（锚点间测距尚未建立） |
 | 位置随时间漂移 | 时钟修正未收敛，用 `--check` 看 `cc` |

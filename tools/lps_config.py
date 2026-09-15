@@ -221,6 +221,7 @@ def probe_firmware(port, quiet=False):
     """
     ser = open_port(port)
     try:
+        reset_console(ser)                    # 先确保不在子菜单里
         banner = read_banner_until(ser, 3.0)  # 开机横幅里带当前 编号/模式
         ser.write(b"m")
         ser.flush()
@@ -230,6 +231,7 @@ def probe_firmware(port, quiet=False):
         ser.flush()
         time.sleep(0.3)
         text += read_banner(ser, 0.5)
+        reset_console(ser)                    # 收尾：确保一定回到主菜单
     finally:
         ser.close()
 
@@ -284,6 +286,21 @@ def send_keys(ser, keys, gap=0.10):
         time.sleep(gap)
 
 
+def reset_console(ser, gap=0.12):
+    """把节点控制台从任何子菜单状态拉回主菜单（幂等，不改变配置）。
+
+    '\\r' 结束数字输入类菜单；'x' 在子菜单里是非法选项（节点会打印 Incorrect ... 并回主菜单），
+    在主菜单里则是无害的未知字符。做这套动作可保证后续按键真被主菜单收到。
+    """
+    for k in (b"\r", b"x", b"\r"):
+        try:
+            ser.write(k)
+            ser.flush()
+        except Exception:
+            return
+        time.sleep(gap)
+
+
 def write_config(port, node_id, mode, mode_keys=None, radio=None):
     """按串口菜单的按键序列写入 ID 与模式（写进 EEPROM，重启后生效）。
 
@@ -300,6 +317,7 @@ def write_config(port, node_id, mode, mode_keys=None, radio=None):
         return False
     try:
         read_banner_until(ser, 2.0)          # 先吃掉开机横幅
+        reset_console(ser)                   # 再确保处于主菜单
         keys = ([str(node_id).encode()] if node_id < 10
                 else [b"i", str(node_id).encode(), b"\n"])
         keys += list(keys_map[mode])
